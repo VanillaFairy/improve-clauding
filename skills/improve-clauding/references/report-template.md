@@ -12,7 +12,7 @@ Not a scoring system. Not another agent.
   `attribution`, `recurrence`, `lens`, `north star`, `systemic`, `mechanical`,
   `endorsement`, `hard-fail`, `zero-information retry`, `clean_candidate` are for
   thinking, not for the page. Say what they mean instead:
-  - "axis moved: tokens" -> "This wastes tokens."
+  - "axis moved: tokens" -> "This cost you about $N."
   - "attribution: agent" -> "This one is on Claude, not you."
   - "attribution: user" -> "This one is a habit worth changing."
   - "recurrence: 5 sessions" -> "Happened in 5 sessions."
@@ -24,6 +24,14 @@ Not a scoring system. Not another agent.
 - Every item needs one real quote and where it came from. One quote, not three.
 - Say what to do differently, concretely, in one sentence. If there is nothing for the
   user to do, say "Nothing for you to change here" and move on.
+- **Always state the expected gain.** Every "Do instead" and every setup item ends with what
+  it buys, in the unit the reader feels: dollars, turns, or minutes of waiting. Derive it
+  from what the finding already cost in this window, and say where the number came from.
+  - "Worth about $90 over a window like this one - that session cost $155 across 409 calls."
+  - "Saves roughly 20 of your turns; you spent 23 on 'continue' alone."
+  - "Cuts about 4 hours of waiting, going by the six log-paste turns at 25-80 minutes each."
+  - If it genuinely cannot be quantified, write "Hard to price, but it removes <X>" -
+    never leave a recommendation with no stated payoff.
 - Numbers: round them. "340k tokens", not "339,580". Give a comparison if it helps
   ("a third of the whole window").
 - Do not repeat a proposal in two places. Patterns own the explanation; the action list
@@ -46,7 +54,7 @@ Covered: N sessions, DATE to DATE. Skipped N short ones. Previous retro: DATE or
 |---|---|---|
 | Getting it right first time | N/5 | <short clause> |
 | Your time spent waiting | N/5 | <short clause> |
-| Token waste | N/5 | <short clause> |
+| Money spent | N/5 | <$ for the window, and the calls x context that drove it> |
 | Reusing what works | N/5 | <short clause> |
 
 <One sentence on the trend vs the previous retro, or "First retro, so this is the baseline.">
@@ -58,9 +66,9 @@ Covered: N sessions, DATE to DATE. Skipped N short ones. Previous retro: DATE or
 <2-4 sentences: what happens, how often, and why it happens. Name who it's on -
 you, Claude, or the tools - in normal words.>
 
-You said: "<quote>" (<date>, <short session name>)
+*You said:* "<quote>" (<date>, <short session name>)
 
-Do instead: <one sentence>
+*Do instead:* <one sentence>
 
 ### 2. ...
 
@@ -84,7 +92,7 @@ how you can tell. Otherwise one line: "First retro - nothing to check yet.">
 <Numbered list. One line each: what it is, which file it touches, which finding it
 came from. Nothing has been changed yet.>
 
-1. Add a rule to <path> so <plain outcome>. (from #1)
+1. Add a rule to <path> so <plain outcome>. Saves <gain>. (from #1)
 2. ...
 
 Say which numbers you want.
@@ -95,6 +103,24 @@ Say which numbers you want.
 too recent to judge, anything the tooling could not see. Two or three lines, not a
 methodology essay.>
 ```
+
+## What to keep when trimming
+
+This is a retro about **habits** - what the user does, and could do differently tomorrow.
+Tooling is secondary. When ranking, and when cutting to the caps:
+
+1. Keep habits first: how tasks are briefed, when work is split, when autonomy is granted,
+   when evidence is demanded, when a session should have ended.
+2. Keep a tooling item only when it is the direct cause of a habit's cost, and write it as
+   the habit ("you became the build system") rather than as a configuration task.
+3. Push pure configuration and plugin-maintenance work to the end of the setup list, or
+   drop it. A missing trigger phrase in a skill is not a retro finding; repeatedly working
+   around a missing trigger is.
+4. Never spend a "Worth fixing" slot on a bug in this retro's own tooling. Those go in the
+   small print, in one line.
+
+Rule of thumb: at least 4 of 6 items under "Worth fixing", and at least half the setup
+list, should be things the user does rather than things the user installs.
 
 ## Length discipline
 

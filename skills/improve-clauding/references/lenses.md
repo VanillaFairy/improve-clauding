@@ -35,8 +35,12 @@ skill text). Otherwise it is "no rule existed" -> user or reusability finding.
 4. **Delegation.** Subagent/Task use, plan mode before large changes, parallel vs sequential,
    exploration done in main context. Signals: `delegations`, `subagent_files`, `sequential_readonly_runs`.
 5. **Wall-clock.** Agent / tool / human clocks (axes.md). Nudges, interrupts, long gaps, turn counts per episode.
-6. **Session hygiene.** Session length, topic drift inside one session, compactions, restarts of the
-   same task in a new session (look for near-identical openers within 48h).
+6. **Session hygiene and spend.** Session length, topic drift inside one session, compactions,
+   restarts of the same task in a new session (near-identical openers within 48h). Price each:
+   cost is calls x context size, so a session kept open across unrelated tasks is the single
+   most expensive habit available. Name the dollar figure per session `[spend.est_cost_usd]`
+   and check how much of it went to subagents `[spend.est_cost_subagents_usd]` - delegation is
+   not free, it just happens off-transcript.
 
 ## Group C - Correctness (analyst C)
 
@@ -67,6 +71,7 @@ For each candidate finding answer:
 
 ## Ranking
 
-score = recurrence x impact, where impact is the estimated turns or tokens saved per occurrence
-on the moved axis. Cap: 10 patterns to fix, 5 to endorse, all hard-fail flags. Proposals are
-attached to findings, never free-floating.
+score = recurrence x impact, where impact is the estimated dollars, turns, or waiting time
+saved per occurrence on the moved axis. Compute it - it becomes the "expected gain" line in
+the report. Habits outrank tooling at equal score. Cap: 10 patterns to fix, 5 to endorse, all
+hard-fail flags. Proposals are attached to findings, never free-floating.

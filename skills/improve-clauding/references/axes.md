@@ -6,24 +6,44 @@ the axis it moves and the axis it costs.
 
 ## Axis 1 - Token efficiency
 
-Goal: fewer tokens per completed task. Not fewer tokens per session.
+Goal: less money per completed task.
+
+**The cost model, because it is counter-intuitive.** Every API call re-sends the whole
+conversation, so spend is dominated by context re-read, not by what the model writes:
+
+    cost ~ number of API calls x size of the context at each call
+
+In the first real window measured here, cache reads were 86% of spend and output tokens
+were a rounding error. Two consequences:
+
+- **A high cache ratio is not efficiency.** It means each call was cheap *per token*. It says
+  nothing about how many calls happened or how big the context was. Never rate this axis well
+  because the cache ratio is high; `[cache_ratio]` is a diagnostic, not a score.
+- **A long session is expensive even when it looks calm.** A 40-turn session re-reads its
+  whole history on every one of hundreds of calls. Splitting a session saves real money;
+  being terse inside one does not.
+
+Headline number: `[spend.est_cost_usd]`. The two levers: `[spend.api_calls]` and
+`[spend.avg_context_per_call]`. Quote dollars in the report - tokens mean nothing to a reader.
 
 Signals (inventory fields in brackets):
-- output tokens and cache ratio per session `[tokens, cache_ratio]`; low cache ratio = context churn
-- tokens spent in turns later corrected or reverted (waste) `[turns[].tokens + flags.correction, git.reverted]`
+- estimated cost, per session and for the window `[spend.est_cost_usd]`
+- subagent spend, which is invisible in the main transcript `[spend.est_cost_subagents_usd]`
+- calls and average context per call `[spend.api_calls, spend.avg_context_per_call]`
+- spend in turns later corrected or reverted, which is pure waste `[turns[].tokens + flags.correction, git.reverted]`
 - re-reads of the same file `[mechanical.re_read_turns]`
-- zero-information retries `[mechanical.zero_info_retries]`
-- compactions per session `[mechanical.compactions]`
-- long sessions that drift across topics `[duration_min, human_turns, repeated topic switches in turns]`
+- retries that added no information `[mechanical.zero_info_retries]`
+- compactions, and sessions running long past their topic `[mechanical.compactions, human_turns, span_hours]`
 
-User habits it exposes: pasting instead of referencing paths; not delegating exploration to
-subagents; running one session past its topic; asking for restatements; verbose back-and-forth
-instead of one specified prompt.
+User habits it exposes: keeping one session open across unrelated tasks; pasting large output
+instead of a path; exploring by hand in the main context instead of delegating; asking again
+without adding anything.
 
-Caveat: JSONL output-token totals can be incomplete, and one API message is written as
-several records that each repeat the full `usage` - the inventory deduplicates by message
-id, so use its numbers rather than counting records. Compare ratios and deltas between
-retros, not absolute cost.
+Caveats: one API message is written as several JSONL records that each repeat the full
+`usage`, so the inventory deduplicates by message id - never count records yourself. Claude
+Code's own `cost-state` field is usually absent or zero; ignore it and use the estimate. The
+estimate uses public list prices from `PRICES` in `inventory.py`, so treat it as an order of
+magnitude and as a basis for comparison between retros.
 
 ## Axis 2 - Actionable reusability
 

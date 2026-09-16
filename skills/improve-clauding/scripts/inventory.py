@@ -186,9 +186,53 @@ def discover_claude():
         for f in proj.glob("*.jsonl"):
             sid = f.stem
             sub_dir = proj / sid / "subagents"
-            n_sub = len(list(sub_dir.rglob("*.jsonl"))) if sub_dir.is_dir() else 0
-            out.append({"tool": "claude", "path": str(f), "session_id": sid, "project_slug": proj.name, "subagent_files": n_sub})
+            subs = [str(p) for p in sub_dir.rglob("*.jsonl")] if sub_dir.is_dir() else []
+            out.append({"tool": "claude", "path": str(f), "session_id": sid, "project_slug": proj.name,
+                        "subagent_files": len(subs), "subagent_paths": subs})
     return out
+
+
+def scan_usage(paths):
+    """Token usage from transcripts we do not otherwise analyze (subagents).
+
+    Subagent work is real spend billed to the parent session, so leaving it out
+    makes delegation look free. Deduplicated by message id like the main pass.
+    """
+    by_fam = defaultdict(lambda: Counter())
+    calls = 0
+    for p in paths:
+        seen = set()
+        try:
+            fh = open(p, encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        with fh:
+            for line in fh:
+                try:
+                    o = json.loads(line)
+                except Exception:
+                    continue
+                if o.get("type") != "assistant":
+                    continue
+                m = o.get("message")
+                if not isinstance(m, dict):
+                    continue
+                mid = m.get("id")
+                if mid is not None:
+                    if mid in seen:
+                        continue
+                    seen.add(mid)
+                u = m.get("usage")
+                if not isinstance(u, dict):
+                    continue
+                calls += 1
+                by_fam[model_family(m.get("model"))].update({
+                    "in": u.get("input_tokens", 0) or 0,
+                    "out": u.get("output_tokens", 0) or 0,
+                    "cache_write": u.get("cache_creation_input_tokens", 0) or 0,
+                    "cache_read": u.get("cache_read_input_tokens", 0) or 0,
+                })
+    return {k: dict(v) for k, v in by_fam.items()}, calls
 
 
 def discover_cursor():
@@ -247,7 +291,7 @@ def parse_session(meta):
     seen_msg_ids = set()
     misc = {"titles": [], "modes": Counter(), "permission_modes": Counter(), "cost_state": None,
             "version": None, "entrypoint": None, "cwd": None, "git_branch": None, "branches": Counter(),
-            "permission_mode_changes": Counter(), "models": Counter(),
+            "permission_mode_changes": Counter(), "models": Counter(), "usage_by_family": defaultdict(Counter),
             "efforts": Counter(), "skills_attributed": Counter(), "compactions": 0, "hook_errors": 0,
             "denials": Counter(), "refusals": 0, "system_subtypes": Counter(), "turn_durations_ms": [],
             "bad_lines": 0, "lines": 0}
@@ -350,6 +394,14 @@ def parse_session(meta):
                 if mid is not None:
                     seen_msg_ids.add(mid)
                 usage = msg.get("usage") if (first_of_msg and isinstance(msg.get("usage"), dict)) else {}
+                if usage:
+                    misc["usage_by_family"][model_family(msg.get("model"))].update({
+                        "in": usage.get("input_tokens", 0) or 0,
+                        "out": usage.get("output_tokens", 0) or 0,
+                        "cache_write": usage.get("cache_creation_input_tokens", 0) or 0,
+                        "cache_read": usage.get("cache_read_input_tokens", 0) or 0,
+                        "calls": 1,
+                    })
                 thinking_chars = sum(len(b.get("thinking", "") or "") for b in blocks if b.get("type") == "thinking")
                 text_chars = sum(len(b.get("text", "") or "") for b in blocks if b.get("type") == "text")
                 tool_uses = []
@@ -522,6 +574,30 @@ def analyze(meta, events, misc, now):
     first_prompt = turns[0]["text"] if turns else ""
     cs = misc["cost_state"] or {}
     age_h = (now - end).total_seconds() / 3600 if end else None
+
+    # Spend. cost-state is mostly absent or zero in practice, so the estimate below is
+    # the number to use; the reported one is kept only for comparison.
+    main_fam = {k: dict(v) for k, v in misc["usage_by_family"].items()}
+    sub_fam, sub_calls = scan_usage(meta.get("subagent_paths") or [])
+    main_calls = sum(v.get("calls", 0) for v in main_fam.values())
+    combined = defaultdict(Counter)
+    for src in (main_fam, sub_fam):
+        for fam, u in src.items():
+            combined[fam].update({k: v for k, v in u.items() if k != "calls"})
+    combined = {k: dict(v) for k, v in combined.items()}
+    cost_main, cost_sub = estimate_cost(main_fam), estimate_cost(sub_fam)
+    ctx_read = sum(u.get("cache_read", 0) + u.get("in", 0) for u in combined.values())
+    all_calls = main_calls + sub_calls
+    spend = {
+        "est_cost_usd": round(cost_main + cost_sub, 2),
+        "est_cost_main_usd": cost_main,
+        "est_cost_subagents_usd": cost_sub,
+        "api_calls": all_calls, "api_calls_main": main_calls, "api_calls_subagents": sub_calls,
+        "context_read_tokens": ctx_read,
+        "avg_context_per_call": round(ctx_read / all_calls) if all_calls else 0,
+        "subagent_usage": {k: v for k, v in sub_fam.items()},
+        "reported_cost_usd": cs.get("totalCostUSD"),
+    }
     avg_q = round(sum(t["quality"]["score"] for t in openers) / len(openers), 2) if openers else None
 
     mech = {
@@ -571,6 +647,7 @@ def analyze(meta, events, misc, now):
         "span_hours": round((end - start).total_seconds() / 3600, 1) if (start and end) else None,
         "human_turns": len(turns), "assistant_msgs": len(assistants),
         "tokens": tok, "cache_ratio": cache_ratio, "thinking_chars": sum(t["thinking_chars"] for t in turns),
+        "spend": spend, "usage_by_family": combined,
         "cost_usd": cs.get("totalCostUSD"), "lines_added": cs.get("totalLinesAdded"), "lines_removed": cs.get("totalLinesRemoved"),
         "api_ms": cs.get("totalAPIDuration"), "tool_ms": cs.get("totalToolDuration"),
         "agent_active_sec": agent_secs, "human_wait_sec": human_secs, "long_gaps": long_gaps,
@@ -590,6 +667,35 @@ def analyze(meta, events, misc, now):
 # ----------------------------------------------------------------------------
 # git correlation (outcome lens)
 # ----------------------------------------------------------------------------
+
+# Public list prices per million tokens: input, output, cache write, cache read.
+# Used only to turn token counts into a number you can feel. Adjust if your plan differs;
+# the retro compares runs, so consistency matters more than exactness.
+PRICES = {
+    "opus":   (15.0, 75.0, 18.75, 1.50),
+    "sonnet": (3.0, 15.0, 3.75, 0.30),
+    "haiku":  (0.80, 4.0, 1.0, 0.08),
+}
+DEFAULT_FAMILY = "sonnet"
+
+
+def model_family(model):
+    m = (model or "").lower()
+    for k in PRICES:
+        if k in m:
+            return k
+    return DEFAULT_FAMILY
+
+
+def estimate_cost(usage_by_family):
+    """usage_by_family: {family: {'in','out','cache_write','cache_read'}} -> USD."""
+    total = 0.0
+    for fam, u in usage_by_family.items():
+        pi, po, pw, pr = PRICES.get(fam, PRICES[DEFAULT_FAMILY])
+        total += (u.get("in", 0) * pi + u.get("out", 0) * po
+                  + u.get("cache_write", 0) * pw + u.get("cache_read", 0) * pr) / 1e6
+    return round(total, 2)
+
 
 GIT_SCAN_LIMIT = 10        # commits inspected per session; lists are labelled when hit
 FOLLOW_UP_DAYS = 14        # how long after a session a "fix" commit still counts as its tail
@@ -707,7 +813,15 @@ def write_summary(run_dir: Path, inv):
     L.append("")
     L.append("## Totals")
     L.append(f"- human turns {s['human_turns']}, assistant msgs {s['assistant_msgs']}, active session time {s['duration_min']} min (idle gaps >60 min excluded), agent-active {s['agent_active_min']} min, human-wait {s['human_wait_min']} min")
-    L.append(f"- tokens: out {fmt_int(s['tokens']['out'])}, cache_read {fmt_int(s['tokens']['cache_read'])}, cache_create {fmt_int(s['tokens']['cache_create'])}, uncached in {fmt_int(s['tokens']['in'])}; cost (reported) ${s['cost_usd']:.2f}" if isinstance(s.get('cost_usd'), (int, float)) else f"- tokens: out {fmt_int(s['tokens']['out'])}, cache_read {fmt_int(s['tokens']['cache_read'])}, cache_create {fmt_int(s['tokens']['cache_create'])}")
+    sp = s["spend"]
+    L.append(f"- SPEND (list-price estimate): ${sp['est_cost_usd']:,.2f} total = ${sp['est_cost_main_usd']:,.2f} main + ${sp['est_cost_subagents_usd']:,.2f} subagents")
+    L.append(f"- {fmt_int(sp['api_calls'])} API calls ({fmt_int(sp['api_calls_main'])} main + {fmt_int(sp['api_calls_subagents'])} subagent), each re-reading {fmt_int(sp['avg_context_per_call'])} tokens of context on average")
+    L.append(f"- context re-read across all calls: {fmt_int(sp['context_read_tokens'])} tokens. This, not output, is where the money goes.")
+    L.append(f"- output {fmt_int(s['tokens']['out'])}, cache_create {fmt_int(s['tokens']['cache_create'])}, uncached in {fmt_int(s['tokens']['in'])} (main sessions only)")
+    L.append("  Do NOT read a high cache ratio as efficiency: it means each call was cheap per token,")
+    L.append("  not that there were few calls or small contexts. Cost = calls x context size.")
+    if isinstance(s.get("cost_usd"), (int, float)):
+        L.append(f"  (Claude Code's own cost-state field reports ${s['cost_usd']:.2f}; it is usually absent or zero - ignore it.)")
     m = s["mechanical"]
     L.append(f"- corrections {m['corrections']}, zero-info retries {m['zero_info_retries']}, nudges {m['nudges']}, frustration turns {m['frustration_turns']}, praise turns {m['praise_turns']}, interrupts {m['interrupts']}")
     L.append(f"- tool errors {m['tool_errors']}, re-read turns {m['re_read_turns']}, sequential read-only runs {m['sequential_readonly_runs']}, compactions {m['compactions']}, denials {m['denials']}")
@@ -733,13 +847,14 @@ def write_summary(run_dir: Path, inv):
     L.append("")
     L.append("## Sessions (sorted by attention score)")
     L.append("")
-    L.append("| # | tool | when | min | turns | out tok | corr | 0-info | nudge | frust | errs | deleg | plan | attn | clean | title / first prompt |")
+    L.append("| # | tool | when | min | turns | est $ | calls | corr | 0-info | nudge | frust | errs | deleg | attn | clean | title / first prompt |")
     L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for n, x in enumerate(inv["sessions"]):
         mm = x["mechanical"]
+        xsp = x.get("spend", {})
         when = (x["start"] or "")[:16].replace("T", " ")
         title = short(x["title"] or x["first_prompt"], 70)
-        L.append(f"| {n} | {x['tool']} | {when} | {x['duration_min'] or '-'} | {x['human_turns']} | {fmt_int(x['tokens']['out'])} | {mm['corrections']} | {mm['zero_info_retries']} | {mm['nudges']} | {mm['frustration_turns']} | {mm['tool_errors']} | {mm['delegations']} | {'y' if mm['plan_mode_used'] else ''} | {x['attention_score']} | {'y' if x['clean_candidate'] else ''} | {title} |")
+        L.append(f"| {n} | {x['tool']} | {when} | {x['duration_min'] or '-'} | {x['human_turns']} | {xsp.get('est_cost_usd', 0):,.0f} | {fmt_int(xsp.get('api_calls', 0))} | {mm['corrections']} | {mm['zero_info_retries']} | {mm['nudges']} | {mm['frustration_turns']} | {mm['tool_errors']} | {mm['delegations']} | {x['attention_score']} | {'y' if x['clean_candidate'] else ''} | {title} |")
     L.append("")
     L.append("## Clean sessions (endorsement candidates)")
     for n, x in enumerate(inv["sessions"]):
@@ -837,7 +952,9 @@ def write_slices(run_dir: Path, inv):
                 L.append(f"- {x['human_turns']} turns ({mm['openers']} opening), avg brief quality {x['avg_prompt_quality']}/5, corrections {mm['corrections']}, retries with no new info {mm['zero_info_retries']}")
                 L.append(f"- rule files in force: {', '.join(rule_files(x['cwd'])) or 'none found'}")
             elif group == "b":
+                xsp = x.get("spend", {})
                 L.append(f"- span {x.get('span_hours')} h, active {x['duration_min']} min, agent-active {round((x['agent_active_sec'] or 0)/60)} min, human-wait {round((x['human_wait_sec'] or 0)/60)} min, long gaps {x['long_gaps']}")
+                L.append(f"- est ${xsp.get('est_cost_usd', 0):,.2f} (${xsp.get('est_cost_subagents_usd', 0):,.2f} of it in subagents) over {fmt_int(xsp.get('api_calls', 0))} calls, avg context per call {fmt_int(xsp.get('avg_context_per_call', 0))} tokens")
                 L.append(f"- delegations {mm['delegations']} (subagent files {mm['subagent_files']}), sequential read-only runs {mm['sequential_readonly_runs']}, compactions {mm['compactions']}")
                 L.append(f"- Claude Code plan mode used: {mm['plan_mode_used']} (this is the IDE mode, NOT planning skills - check `skills attributed` in summary.md before claiming the user never plans)")
                 L.append(f"- permission mode per turn: {x['permission_modes'] or 'none recorded'}; mode-switch events during the session: {x.get('permission_mode_changes') or 'none'}")
@@ -856,7 +973,8 @@ def write_slices(run_dir: Path, inv):
                 if x["outcome_pending"]:
                     L.append("- OUTCOME PENDING (<24h old): do not claim outcomes for this session")
             else:
-                L.append(f"- {x['human_turns']} turns, active {x['duration_min']} min, out {fmt_int(x['tokens']['out'])} tok, cache ratio {x['cache_ratio']}, praise {mm['praise_turns']}, corrections {mm['corrections']}, clean {x['clean_candidate']}")
+                xsp = x.get("spend", {})
+                L.append(f"- {x['human_turns']} turns, active {x['duration_min']} min, est ${xsp.get('est_cost_usd', 0):,.2f} over {fmt_int(xsp.get('api_calls', 0))} calls, praise {mm['praise_turns']}, corrections {mm['corrections']}, clean {x['clean_candidate']}")
                 L.append(f"- delegations {mm['delegations']}, commits {mm['commits']}, lines +{x['lines_added']}/-{x['lines_removed']}, skills {x['skills_attributed'] or 'none'}")
             if total > len(turns):
                 L.append(f"- showing {len(turns)} of {total} relevant turns (excerpt.py for the rest)")
@@ -1009,6 +1127,11 @@ def main(argv=None):
                 openers[" ".join(words)] += 1
     q_vals = [s["avg_prompt_quality"] for s in sessions if s.get("avg_prompt_quality") is not None]
     costs = [s["cost_usd"] for s in sessions if isinstance(s.get("cost_usd"), (int, float))]
+    sp_keys = ("est_cost_usd", "est_cost_main_usd", "est_cost_subagents_usd", "api_calls",
+               "api_calls_main", "api_calls_subagents", "context_read_tokens")
+    spend_tot = {k: round(sum((s.get("spend", {}).get(k, 0) or 0) for s in sessions), 2) for k in sp_keys}
+    spend_tot["avg_context_per_call"] = (round(spend_tot["context_read_tokens"] / spend_tot["api_calls"])
+                                         if spend_tot["api_calls"] else 0)
     summary = {
         "sessions": len(sessions), "by_tool": dict(Counter(s["tool"] for s in sessions)), "skipped_trivial": skipped,
         "human_turns": sum(s.get("human_turns", 0) for s in sessions), "assistant_msgs": sum(s.get("assistant_msgs", 0) for s in sessions),
@@ -1016,6 +1139,7 @@ def main(argv=None):
         "agent_active_min": round(sum(s.get("agent_active_sec") or 0 for s in sessions) / 60),
         "human_wait_min": round(sum(s.get("human_wait_sec") or 0 for s in sessions) / 60),
         "tokens": {k: agg(k) for k in ("in", "out", "cache_read", "cache_create")},
+        "spend": spend_tot,
         "cost_usd": sum(costs) if costs else None,
         "mechanical": mech, "tools": dict(tools.most_common(20)),
         "skills_attributed": dict(skills_attr.most_common(20)), "skill_tool_calls": dict(skill_calls.most_common(20)),

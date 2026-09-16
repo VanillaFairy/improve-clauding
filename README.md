@@ -85,6 +85,13 @@ loud, each with one real quote and one concrete thing to do differently. Caps: 1
 
 ## Measurement caveats the script handles for you
 
+- Spend is estimated from token usage at list prices, because Claude Code's own
+  `cost-state` field is almost always absent or zero (2 nonzero records in a 92-session
+  corpus, summing to $18 against a real ~$2,400).
+- Subagent transcripts are scanned for usage and billed to their parent session. They were
+  26% of spend in the first measured window and are invisible in the main transcript.
+- Cost is reported as dollars, calls, and average context per call, because spend is
+  `calls x context size`. A high cache ratio is explicitly flagged as *not* efficiency.
 - Token totals are deduplicated by message id (naive summing inflates them ~2x).
 - Prompt quality is scored only on *opening* prompts (session start, or after a 2h+
   break). A terse follow-up inside a live thread is not a bad prompt.

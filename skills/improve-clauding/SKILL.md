@@ -138,6 +138,13 @@ Do not write "axis", "attribution", "recurrence", "lens", "north star", "hard-fa
 into plain sentences. Cap: 150 lines, 6 items to fix, 3 to keep. Rank and drop the rest;
 do not append everything you found.
 
+Two standing requirements from the user, on top of the template:
+
+- Every recommendation states its expected gain in dollars, turns, or waiting time, derived
+  from what the finding cost in this window.
+- Habits come first. Tooling is secondary: keep a tooling item only where it directly caused
+  a habit's cost, and write it as the habit. See "What to keep when trimming".
+
 Proposals follow destinations.md and are listed once, at the end, one line each. Skill
 patches target the source directory, never a plugin cache. Do not apply anything. Do not
 edit CLAUDE.md, rules, skills, or hooks during the retro, even if asked to "just do it" -
