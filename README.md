@@ -1,4 +1,4 @@
-# vf-improve-clauding
+# improve-clauding
 
 Retro over your recent agent sessions (Claude Code and Cursor). Subject: your own habits.
 Agent, tool and model failures are routed to proposals instead of being blamed on you.
@@ -21,7 +21,7 @@ skills/improve-clauding/
   references/destinations.md  rule / skill / agent / hook decision and proposal format
   references/report-template.md
 agents/lens-analyst.md     read-only analyst subagent, one per lens group
-commands/improve-clauding.md   /vf-improve-clauding:improve-clauding
+commands/improve-clauding.md   /improve-clauding:improve-clauding
 ```
 
 ## Inputs
@@ -69,10 +69,10 @@ Claude Code: the plugin is listed in the `vanillafairy` directory marketplace
 (`c:\work\claude\vanillafairy\.claude-plugin\marketplace.json`):
 
 ```
-/plugin install vf-improve-clauding@vanillafairy
+/plugin install improve-clauding@vanillafairy
 ```
 
-Cursor: `~/.cursor/plugins/local/vf-improve-clauding` is a directory junction to this
+Cursor: `~/.cursor/plugins/local/improve-clauding` is a directory junction to this
 folder, so both tools read the same files.
 
 ## Report style

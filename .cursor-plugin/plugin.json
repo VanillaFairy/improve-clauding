@@ -1,5 +1,5 @@
 {
-  "name": "vf-improve-clauding",
+  "name": "improve-clauding",
   "displayName": "Improve Clauding",
   "description": "Retrospective over recent Claude Code and Cursor sessions: separates the user's habits from agent/tool/model failures, reports patterns to fix and to endorse along four axes (tokens, reusability, wall-clock, intelligence), and proposes rules, skill patches, skills, agents or hooks without applying them.",
   "version": "0.1.0",
