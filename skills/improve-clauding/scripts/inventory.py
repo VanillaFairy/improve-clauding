@@ -246,7 +246,8 @@ def parse_session(meta):
     # each repeating the full usage. Count usage once per message id.
     seen_msg_ids = set()
     misc = {"titles": [], "modes": Counter(), "permission_modes": Counter(), "cost_state": None,
-            "version": None, "entrypoint": None, "cwd": None, "git_branch": None, "models": Counter(),
+            "version": None, "entrypoint": None, "cwd": None, "git_branch": None, "branches": Counter(),
+            "permission_mode_changes": Counter(), "models": Counter(),
             "efforts": Counter(), "skills_attributed": Counter(), "compactions": 0, "hook_errors": 0,
             "denials": Counter(), "refusals": 0, "system_subtypes": Counter(), "turn_durations_ms": [],
             "bad_lines": 0, "lines": 0}
@@ -268,8 +269,10 @@ def parse_session(meta):
             for k in ("cwd", "version", "entrypoint"):
                 if rec.get(k) and not misc.get(k):
                     misc[k] = rec.get(k)
-            if rec.get("gitBranch") and not misc["git_branch"]:
-                misc["git_branch"] = rec.get("gitBranch")
+            if rec.get("gitBranch"):
+                misc["branches"][rec["gitBranch"]] += 1
+                if not misc["git_branch"]:
+                    misc["git_branch"] = rec["gitBranch"]
             if rec.get("attributionSkill"):
                 misc["skills_attributed"][rec["attributionSkill"]] += 1
             if rec.get("isCompactSummary") or t in ("summary", "compact_boundary"):
@@ -288,7 +291,8 @@ def parse_session(meta):
                 misc["modes"][str(rec.get("mode"))] += 1
                 continue
             if t == "permission-mode":
-                misc["permission_modes"][str(rec.get("permissionMode"))] += 1
+                # a mode-change event, not a turn; kept separate so the two never mix
+                misc["permission_mode_changes"][str(rec.get("permissionMode"))] += 1
                 continue
             if t == "cost-state":
                 misc["cost_state"] = rec
@@ -314,8 +318,6 @@ def parse_session(meta):
             text, blocks = text_of(content)
 
             if role == "user" or t == "user":
-                if rec.get("permissionMode"):
-                    misc["permission_modes"][str(rec["permissionMode"])] += 1
                 tool_results = [b for b in blocks if b.get("type") == "tool_result"]
                 if tool_results:
                     for b in tool_results:
@@ -333,6 +335,9 @@ def parse_session(meta):
                     continue
                 text = INJECTED_TAG_RE.sub("", text)
                 if is_human_prompt(rec, text, blocks):
+                    # count the mode once per human turn, not once per tool result
+                    if rec.get("permissionMode"):
+                        misc["permission_modes"][str(rec["permissionMode"])] += 1
                     events.append({"kind": "prompt", "ts": ts, "text": text, "uuid": rec.get("uuid"),
                                    "has_image": any(b.get("type") in ("image", "document") for b in blocks)})
                 continue
@@ -362,7 +367,7 @@ def parse_session(meta):
                                "thinking_chars": thinking_chars, "text_chars": text_chars,
                                "tool_uses": tool_uses, "stop_reason": msg.get("stop_reason"),
                                "sidechain": bool(rec.get("isSidechain")), "effort": rec.get("effort"),
-                               "msg_id": mid, "first_of_msg": first_of_msg})
+                               "msg_id": mid, "first_of_msg": first_of_msg, "branch": rec.get("gitBranch")})
                 continue
     return events, misc
 
@@ -399,6 +404,7 @@ def analyze(meta, events, misc, now):
         delegations = 0
         edits = Counter()
         commits = 0
+        commit_branches = set()
         no_verify = 0
         force_push = 0
         skills = Counter()
@@ -428,6 +434,9 @@ def analyze(meta, events, misc, now):
                         cmd = tu["target"]
                         if GIT_COMMIT_RE.search(cmd):
                             commits += 1
+                            # branch as of this record, not as of session start
+                            if e.get("branch"):
+                                commit_branches.add(e["branch"])
                         if NO_VERIFY_RE.search(cmd):
                             no_verify += 1
                         if FORCE_PUSH_RE.search(cmd):
@@ -473,13 +482,20 @@ def analyze(meta, events, misc, now):
             "assistant_msgs": sum(1 for e in seg if e["kind"] == "assistant" and e.get("first_of_msg", True)),
             "tools": dict(tools.most_common(12)), "tool_errors": errors, "error_tools": dict(err_tools),
             "re_reads": re_reads, "sequential_readonly_runs": single_ro_seq, "delegations": delegations,
-            "edit_churn_files": churn_files[:5], "commits": commits, "no_verify": no_verify, "force_push": force_push,
+            "edit_churn_files": churn_files[:5], "commits": commits, "commit_branches": sorted(commit_branches),
+            "no_verify": no_verify, "force_push": force_push,
             "skills": dict(skills), "slash": slashes, "plan_mode_tools": plan_mode,
             "tokens": {"in": tok_in, "out": tok_out, "cache_read": cache_r, "cache_create": cache_c},
             "thinking_chars": thinking,
         })
     for t in turns:
         del t["text_full"]
+    # A terse follow-up inside a live thread is not a bad prompt - the context is
+    # already there. Only opening prompts are scored as task briefs: the first turn
+    # of the session, or one the user came back to after a break.
+    for n, t in enumerate(turns):
+        t["is_opener"] = n == 0 or (turns[n - 1]["human_wait_seconds"] or 0) >= OPENER_GAP_SEC
+    openers = [t for t in turns if t["is_opener"]]
 
     # ---- session-level aggregates
     tok = {k: sum(t["tokens"][k] for t in turns) for k in ("in", "out", "cache_read", "cache_create")}
@@ -506,7 +522,7 @@ def analyze(meta, events, misc, now):
     first_prompt = turns[0]["text"] if turns else ""
     cs = misc["cost_state"] or {}
     age_h = (now - end).total_seconds() / 3600 if end else None
-    avg_q = round(sum(t["quality"]["score"] for t in turns) / len(turns), 2) if turns else None
+    avg_q = round(sum(t["quality"]["score"] for t in openers) / len(openers), 2) if openers else None
 
     mech = {
         "tool_errors": n_err,
@@ -524,13 +540,16 @@ def analyze(meta, events, misc, now):
         "commits": sum(t["commits"] for t in turns),
         "no_verify": sum(t["no_verify"] for t in turns),
         "force_push": sum(t["force_push"] for t in turns),
-        "on_main_with_commits": bool(misc["git_branch"] in ("main", "master") and sum(t["commits"] for t in turns)),
+        "commit_branches": sorted({b for t in turns for b in t["commit_branches"]}),
+        "on_main_with_commits": any(b in ("main", "master", "trunk", "develop")
+                                    for t in turns for b in t["commit_branches"]),
         "denials": dict(misc["denials"]),
         "compactions": misc["compactions"],
         "hook_errors": misc["hook_errors"],
         "refusals": misc["refusals"],
         "plan_mode_used": plan_used,
-        "low_quality_prompts": sum(1 for t in turns if t["quality"]["score"] <= 1 and not t["flags"]["nudge"] and t["chars"] > 0),
+        "openers": len(openers),
+        "low_quality_openers": sum(1 for t in openers if t["quality"]["score"] <= 1 and not t["flags"]["nudge"]),
     }
     # heuristic attention score: how much this session deserves LLM reading
     attention = (mech["corrections"] * 2 + mech["zero_info_retries"] * 3 + mech["frustration_turns"] * 4 +
@@ -542,7 +561,9 @@ def analyze(meta, events, misc, now):
 
     return {
         "tool": meta["tool"], "session_id": meta["session_id"], "project_slug": meta["project_slug"], "path": meta["path"],
-        "title": title, "first_prompt": short(first_prompt, 160), "cwd": misc["cwd"], "git_branch": misc["git_branch"],
+        "title": title, "first_prompt": short(first_prompt, 160), "cwd": misc["cwd"],
+        "git_branch": misc["branches"].most_common(1)[0][0] if misc["branches"] else None,
+        "branches": dict(misc["branches"]),
         "entrypoint": misc["entrypoint"], "app_version": misc["version"],
         "start": iso(start), "end": iso(end), "age_hours": round(age_h, 1) if age_h is not None else None,
         "outcome_pending": bool(age_h is not None and age_h < 24),
@@ -553,7 +574,9 @@ def analyze(meta, events, misc, now):
         "cost_usd": cs.get("totalCostUSD"), "lines_added": cs.get("totalLinesAdded"), "lines_removed": cs.get("totalLinesRemoved"),
         "api_ms": cs.get("totalAPIDuration"), "tool_ms": cs.get("totalToolDuration"),
         "agent_active_sec": agent_secs, "human_wait_sec": human_secs, "long_gaps": long_gaps,
-        "models": dict(misc["models"]), "efforts": dict(misc["efforts"]), "permission_modes": dict(misc["permission_modes"]),
+        "models": dict(misc["models"]), "efforts": dict(misc["efforts"]),
+        "permission_modes": dict(misc["permission_modes"]),
+        "permission_mode_changes": dict(misc["permission_mode_changes"]),
         "tools": dict(tool_counter.most_common(15)),
         "skills_attributed": dict(misc["skills_attributed"].most_common(10)), "skill_tool_calls": dict(skill_tools),
         "slash_commands": dict(slash_cmds),
@@ -567,6 +590,10 @@ def analyze(meta, events, misc, now):
 # ----------------------------------------------------------------------------
 # git correlation (outcome lens)
 # ----------------------------------------------------------------------------
+
+GIT_SCAN_LIMIT = 10        # commits inspected per session; lists are labelled when hit
+FOLLOW_UP_DAYS = 14        # how long after a session a "fix" commit still counts as its tail
+
 
 def git(cwd, *args, timeout=15):
     try:
@@ -583,21 +610,38 @@ def git_correlate(sess):
     if not git(cwd, "rev-parse", "--is-inside-work-tree").strip():
         return None
     since, until = sess["start"], sess["end"]
+    # follow-ups are only meaningful for a while after the session; without an upper
+    # bound every long-lived file collects unrelated "fix" commits forever
+    end_dt = parse_ts(until)
+    horizon = iso(end_dt + dt.timedelta(days=FOLLOW_UP_DAYS)) if end_dt else None
     log = git(cwd, "log", "--all", f"--since={since}", f"--until={until}", "--format=%h%x09%s", "--no-merges")
     commits = [l.split("\t", 1) for l in log.splitlines() if l.strip()]
-    out = {"commits_in_window": [{"hash": h, "subject": short(s, 90)} for h, s in commits[:10]]}
+    out = {"commits_in_window": [{"hash": h, "subject": short(s, 90)} for h, s in commits[:GIT_SCAN_LIMIT]],
+           "commits_total": len(commits),
+           "commits_truncated": len(commits) > GIT_SCAN_LIMIT,
+           "follow_up_window_days": FOLLOW_UP_DAYS}
     reverted, fixups = [], []
-    for h, s in commits[:10]:
+    seen_fixups = set()
+    for h, s in commits[:GIT_SCAN_LIMIT]:
         if git(cwd, "log", "--all", f"--since={until}", f"--grep=This reverts commit {h}", "--format=%h").strip():
             reverted.append(h)
-        files = git(cwd, "show", "--name-only", "--format=", h).split()
-        if files:
-            after = git(cwd, "log", "--all", f"--since={until}", "--format=%h%x09%s", "--no-merges", "-i", "-E", "--grep=fix|revert|hotfix|regress|oops", "--", *files[:10])
-            for l in after.splitlines()[:5]:
-                fh, fs = l.split("\t", 1)
-                fixups.append({"hash": fh, "subject": short(fs, 90), "after": h})
+        files = [f for f in git(cwd, "show", "--name-only", "--format=", h).splitlines() if f.strip()]
+        if not files:
+            continue
+        args = ["log", "--all", f"--since={until}", "--format=%h%x09%s", "--no-merges", "-i", "-E",
+                "--grep=fix|revert|hotfix|regress|oops"]
+        if horizon:
+            args.append(f"--until={horizon}")
+        after = git(cwd, *args, "--", *files[:10])
+        for l in after.splitlines()[:5]:
+            fh, fs = l.split("\t", 1)
+            if fh in seen_fixups:
+                continue  # one later fix touching several of these files is one fix
+            seen_fixups.add(fh)
+            fixups.append({"hash": fh, "subject": short(fs, 90), "after": h})
     out["reverted"] = reverted
-    out["follow_up_fixes"] = fixups[:10]
+    out["follow_up_fixes"] = fixups[:GIT_SCAN_LIMIT]
+    out["follow_up_truncated"] = len(fixups) > GIT_SCAN_LIMIT
     return out
 
 
@@ -632,6 +676,7 @@ SLICES = {
 }
 TURNS_PER_SESSION = 12
 SESSIONS_PER_SLICE = 10
+OPENER_GAP_SEC = 7200      # a prompt after this much silence starts a fresh brief
 
 
 def fmt_int(n):
@@ -666,8 +711,10 @@ def write_summary(run_dir: Path, inv):
     m = s["mechanical"]
     L.append(f"- corrections {m['corrections']}, zero-info retries {m['zero_info_retries']}, nudges {m['nudges']}, frustration turns {m['frustration_turns']}, praise turns {m['praise_turns']}, interrupts {m['interrupts']}")
     L.append(f"- tool errors {m['tool_errors']}, re-read turns {m['re_read_turns']}, sequential read-only runs {m['sequential_readonly_runs']}, compactions {m['compactions']}, denials {m['denials']}")
-    L.append(f"- delegations {m['delegations']} (subagent files {m['subagent_files']}), plan-mode sessions {m['plan_mode_sessions']}, commits {m['commits']}, --no-verify {m['no_verify']}, force-push {m['force_push']}, commits on main {m['on_main_with_commits']}")
-    L.append(f"- avg prompt quality {s['avg_prompt_quality']} / 5, low-quality prompts {m['low_quality_prompts']}")
+    L.append(f"- delegations {m['delegations']} (subagent files {m['subagent_files']}), commits {m['commits']}, --no-verify {m['no_verify']}, force-push {m['force_push']}, sessions committing on a shared branch {m['on_main_with_commits']}")
+    L.append(f"- sessions using Claude Code plan mode {m['plan_mode_sessions']} (the IDE mode only; planning *skills* are in the list below)")
+    L.append(f"- opening prompts {m['openers']} of {s['human_turns']} turns; average brief quality {s['avg_prompt_quality']} / 5; thin briefs {m['low_quality_openers']}")
+    L.append("  (quality is scored only on opening prompts - a terse follow-up inside a live thread is not a bad prompt)")
     L.append("")
     L.append("## Tool mix")
     L.append(", ".join(f"{k} {v}" for k, v in s["tools"].items()) or "-")
@@ -701,9 +748,15 @@ def write_summary(run_dir: Path, inv):
     L.append("")
     if inv["git"]:
         L.append("## Git outcome signals")
+        L.append(f"Only the first {GIT_SCAN_LIMIT} commits per session are inspected, and a "
+                 f"\"fix\" commit counts as a follow-up only within {FOLLOW_UP_DAYS} days. "
+                 "`+` means the list hit that cap - it is a floor, not a count.")
         for n, g in inv["git"].items():
             x = inv["sessions"][int(n)]
-            L.append(f"- [{n}] {short(x['title'] or x['first_prompt'], 60)}: commits {len(g['commits_in_window'])}, reverted {g['reverted'] or 'none'}, follow-up fixes {len(g['follow_up_fixes'])}")
+            nf = len(g["follow_up_fixes"])
+            L.append(f"- [{n}] {short(x['title'] or x['first_prompt'], 60)}: commits {g['commits_total']}"
+                     f"{' (only first ' + str(GIT_SCAN_LIMIT) + ' inspected)' if g['commits_truncated'] else ''}"
+                     f", reverted {g['reverted'] or 'none'}, follow-up fixes {nf}{'+' if g.get('follow_up_truncated') else ''}")
         L.append("")
     L.append("Per-turn detail is NOT here. Each lens group has its own slice file in this")
     L.append("directory; read only yours. For a bounded window around one turn, run")
@@ -755,8 +808,11 @@ def write_slices(run_dir: Path, inv):
     for group in SLICES:
         L = _slice_header(group, run_dir, inv)
         if group == "a":
-            L.append("Per turn: `t<i> <ts> [flags] q<score> <missing context elements> : prompt`.")
+            L.append("Per turn: `t<i> <ts> OPEN|cont [flags] q<score> <missing context elements> : prompt`.")
             L.append("`missing` lists what the prompt lacked: path, error, code, criteria, intent.")
+            L.append("`OPEN` = an opening prompt (session start, or after a 2h+ break); judge these as task")
+            L.append("briefs. `cont` = a follow-up inside a live thread - terse is fine there, so only call it")
+            L.append("out if it is a retry that never says what went wrong.")
         elif group == "b":
             L.append("Per turn: agent seconds, human wait, assistant msgs, tools, delegations, sequential read-only runs.")
         elif group == "c":
@@ -778,19 +834,25 @@ def write_slices(run_dir: Path, inv):
             mm = x["mechanical"]
             L.append(f"## [{n}] {x['tool']} {x['session_id']} - {short(x['title'] or x['first_prompt'], 70)}")
             if group == "a":
-                L.append(f"- {x['human_turns']} turns, avg quality {x['avg_prompt_quality']}/5, corrections {mm['corrections']}, zero-info retries {mm['zero_info_retries']}")
+                L.append(f"- {x['human_turns']} turns ({mm['openers']} opening), avg brief quality {x['avg_prompt_quality']}/5, corrections {mm['corrections']}, retries with no new info {mm['zero_info_retries']}")
                 L.append(f"- rule files in force: {', '.join(rule_files(x['cwd'])) or 'none found'}")
             elif group == "b":
                 L.append(f"- span {x.get('span_hours')} h, active {x['duration_min']} min, agent-active {round((x['agent_active_sec'] or 0)/60)} min, human-wait {round((x['human_wait_sec'] or 0)/60)} min, long gaps {x['long_gaps']}")
-                L.append(f"- delegations {mm['delegations']} (subagent files {mm['subagent_files']}), sequential read-only runs {mm['sequential_readonly_runs']}, compactions {mm['compactions']}, plan mode {mm['plan_mode_used']}")
+                L.append(f"- delegations {mm['delegations']} (subagent files {mm['subagent_files']}), sequential read-only runs {mm['sequential_readonly_runs']}, compactions {mm['compactions']}")
+                L.append(f"- Claude Code plan mode used: {mm['plan_mode_used']} (this is the IDE mode, NOT planning skills - check `skills attributed` in summary.md before claiming the user never plans)")
+                L.append(f"- permission mode per turn: {x['permission_modes'] or 'none recorded'}; mode-switch events during the session: {x.get('permission_mode_changes') or 'none'}")
                 L.append(f"- tools: {x['tools']}")
             elif group == "c":
                 L.append(f"- tool errors {mm['tool_errors']}, denials {mm['denials']}, commits {mm['commits']}, churned files {mm['edit_churn_files'] or 'none'}, lines +{x['lines_added']}/-{x['lines_removed']}")
-                L.append(f"- hard-fail: --no-verify {mm['no_verify']}, force-push {mm['force_push']}, commits on {x['git_branch']} {mm['on_main_with_commits']}")
+                L.append(f"- branches seen: {x.get('branches') or 'none'}; commits were made on: {mm.get('commit_branches') or 'none'}")
+                L.append(f"- hard-fail: --no-verify {mm['no_verify']}, force-push {mm['force_push']}, committed on a shared branch {mm['on_main_with_commits']}")
                 L.append(f"- skills attributed: {x['skills_attributed'] or 'none'}")
                 g = inv.get("git", {}).get(str(n))
                 if g:
-                    L.append(f"- git: commits {[c['hash'] for c in g['commits_in_window']]}, reverted {g['reverted'] or 'none'}, follow-up fixes {[f['hash'] for f in g['follow_up_fixes']] or 'none'}")
+                    L.append(f"- git: {g['commits_total']} commits in window {[c['hash'] for c in g['commits_in_window']]}"
+                             f"{' (only first ' + str(GIT_SCAN_LIMIT) + ' inspected)' if g['commits_truncated'] else ''}")
+                    L.append(f"- git: reverted {g['reverted'] or 'none'}; follow-up fixes within {g['follow_up_window_days']} days "
+                             f"{[f['hash'] for f in g['follow_up_fixes']] or 'none'}{' (capped - floor, not a count)' if g.get('follow_up_truncated') else ''}")
                 if x["outcome_pending"]:
                     L.append("- OUTCOME PENDING (<24h old): do not claim outcomes for this session")
             else:
@@ -805,7 +867,7 @@ def write_slices(run_dir: Path, inv):
                     missing = ",".join(k for k in ("path", "error", "code", "criteria", "intent")
                                        if not q.get({"path": "has_path", "error": "has_error_text", "code": "has_code",
                                                      "criteria": "has_criteria", "intent": "has_intent"}[k])) or "-"
-                    L.append(f"  - t{t['i']} {t['ts']} [{f}] q{q['score']} missing:{missing} : {short(t['text'], 240)}")
+                    L.append(f"  - t{t['i']} {t['ts']} {'OPEN' if t.get('is_opener') else 'cont'} [{f}] q{q['score']} missing:{missing} : {short(t['text'], 240)}")
                 elif group == "b":
                     L.append(f"  - t{t['i']} {t['ts']} [{f}] agent {t['agent_seconds']}s wait {t['human_wait_seconds']}s msgs {t['assistant_msgs']} deleg {t['delegations']} seqRO {t['sequential_readonly_runs']} tools {t['tools']} : {short(t['text'], 80)}")
                 elif group == "c":
@@ -926,7 +988,7 @@ def main(argv=None):
         return sum((s.get("tokens", {}).get(key, 0) or 0) for s in sessions)
     mech_keys = ["tool_errors", "corrections", "zero_info_retries", "nudges", "frustration_turns", "praise_turns", "interrupts",
                  "re_read_turns", "sequential_readonly_runs", "compactions", "delegations", "subagent_files", "commits", "no_verify",
-                 "force_push", "low_quality_prompts"]
+                 "force_push", "openers", "low_quality_openers"]
     mech = {k: sum((s.get("mechanical", {}).get(k, 0) or 0) for s in sessions) for k in mech_keys}
     mech["denials"] = sum(sum(s.get("mechanical", {}).get("denials", {}).values()) for s in sessions)
     mech["plan_mode_sessions"] = sum(1 for s in sessions if s.get("mechanical", {}).get("plan_mode_used"))

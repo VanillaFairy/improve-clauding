@@ -1,59 +1,104 @@
-# Report template
+# Report: how to write it
 
-File: `~/.improve-clauding/reports/YYYY-MM-DD-retro-NN.md`. Keep it under ~250 lines.
-Write for the user (plain, short sentences). Evidence pointers are `[session#/turn#]` from
-the inventory digest plus the session id once per finding.
+File: `~/.improve-clauding/reports/YYYY-MM-DD-retro-NN.md`. Hard limit 150 lines.
+
+The reader is the user, on a Wednesday afternoon, deciding what to change tomorrow.
+Not a scoring system. Not another agent.
+
+## Writing rules
+
+- Plain English. Short sentences. One idea per sentence.
+- Never print the internal vocabulary. The words `axis`, `axis moved`, `axis cost`,
+  `attribution`, `recurrence`, `lens`, `north star`, `systemic`, `mechanical`,
+  `endorsement`, `hard-fail`, `zero-information retry`, `clean_candidate` are for
+  thinking, not for the page. Say what they mean instead:
+  - "axis moved: tokens" -> "This wastes tokens."
+  - "attribution: agent" -> "This one is on Claude, not you."
+  - "attribution: user" -> "This one is a habit worth changing."
+  - "recurrence: 5 sessions" -> "Happened in 5 sessions."
+  - "zero-information retry" -> "You asked again without saying what was wrong."
+- No metadata bullets under a heading. Write prose, then the evidence line.
+- Say the finding in the heading, as a sentence a human would say out loud.
+  Good: "A bug got 'fixed' five times in five weeks because nobody wrote a test."
+  Bad: "Verification gap in regression-prone bug class (intelligence axis)."
+- Every item needs one real quote and where it came from. One quote, not three.
+- Say what to do differently, concretely, in one sentence. If there is nothing for the
+  user to do, say "Nothing for you to change here" and move on.
+- Numbers: round them. "340k tokens", not "339,580". Give a comparison if it helps
+  ("a third of the whole window").
+- Do not repeat a proposal in two places. Patterns own the explanation; the action list
+  at the end is just short lines with numbers.
+- No emoji, no bold-per-bullet, no severity icons.
+
+## Structure
 
 ```markdown
 # Clauding retro NN - YYYY-MM-DD
 
-Window: <first session date> -> <last session date> | sessions: N (claude X, cursor Y) | turns: N
-Previous retro: <date or none> | inventory: <run dir>
+<2-4 sentences: what this window looked like and the single most useful takeaway.
+Write it last. No numbers except the ones that matter.>
 
-## Scores (1-5, delta vs previous)
+Covered: N sessions, DATE to DATE. Skipped N short ones. Previous retro: DATE or "none".
 
-| axis | score | delta | one-line reason |
-|---|---|---|---|
-| token efficiency | | | |
-| reusability | | | |
-| wall-clock | | | |
-| intelligence | | | |
+## How it's going
 
-North star: correct episodes / (user turns + tokens/10k) = <value> (prev <value>)
+| what | rating | why |
+|---|---|---|
+| Getting it right first time | N/5 | <short clause> |
+| Your time spent waiting | N/5 | <short clause> |
+| Token waste | N/5 | <short clause> |
+| Reusing what works | N/5 | <short clause> |
 
-## Hard-fail flags
+<One sentence on the trend vs the previous retro, or "First retro, so this is the baseline.">
 
-- none | <flag> [s/t] <evidence>
+## Worth fixing
 
-## Patterns to fix (max 10, ranked)
+### 1. <the finding as a plain sentence>
 
-### 1. <pattern name>
-- axis moved: <axis> | axis cost: <axis or none> | attribution: user|agent|env|model
-- recurrence: N sessions ([s/t], [s/t], ...)
-- evidence: "<quote>" (session <id>, <timestamp>)
-- root cause: <one sentence>
-- fix: <what the user does differently next time, one sentence>
-- proposal: <destination> - <exact text or diff> | or "none (habit only)"
+<2-4 sentences: what happens, how often, and why it happens. Name who it's on -
+you, Claude, or the tools - in normal words.>
 
-## Patterns to endorse (max 5)
+You said: "<quote>" (<date>, <short session name>)
 
-### 1. <pattern name>
-- axis: <axis> | win: <quantified>
-- evidence: [s/t] "<quote>"
-- template: <reusable prompt or workflow, if any>
+Do instead: <one sentence>
 
-## Recommendation follow-through (from previous retro)
+### 2. ...
 
-| # | recommendation | status | evidence |
-|---|---|---|---|
-| | | adopted / partial / not adopted / unknown | |
+## Worth keeping
 
-## Proposals awaiting approval
+### 1. <what you did well, as a plain sentence>
 
-Numbered list. Each: destination, target path, exact content. Nothing here has been applied.
+<1-3 sentences, with the payoff in plain numbers.>
 
-## Notes
+You said: "<quote>" (<date>, <short session name>)
 
-- sessions marked outcome-pending (<24h): [s], [s]
-- parse issues / gaps: <cursor format unverified, N bad lines, ...>
+Reuse it: <the template, in quotes, with <placeholders>>
+
+## Last time's suggestions
+
+<Table only if a previous retro exists: what was suggested, whether it happened,
+how you can tell. Otherwise one line: "First retro - nothing to check yet.">
+
+## What I can set up for you
+
+<Numbered list. One line each: what it is, which file it touches, which finding it
+came from. Nothing has been changed yet.>
+
+1. Add a rule to <path> so <plain outcome>. (from #1)
+2. ...
+
+Say which numbers you want.
+
+## Small print
+
+<Only what changes how to read the above: counts that are floors not totals, sessions
+too recent to judge, anything the tooling could not see. Two or three lines, not a
+methodology essay.>
 ```
+
+## Length discipline
+
+At most 6 items under "Worth fixing" and 3 under "Worth keeping" in the written report,
+even when the analysis found more. Ranking exists so the rest can be dropped. If a
+finding cannot be explained in four sentences, it is two findings or it is not understood
+yet.

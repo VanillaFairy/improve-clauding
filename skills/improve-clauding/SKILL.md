@@ -129,11 +129,22 @@ recurrence count dropping). Unknown is allowed; guessing is not.
 
 ### 7. Report and proposals
 
-Write `~/.improve-clauding/reports/YYYY-MM-DD-retro-NN.md` from the template. Proposals
-follow destinations.md: destination, target path, exact content. Skill patches target the
-source directory, never a plugin cache. Do not apply anything. Do not edit CLAUDE.md,
-rules, skills, or hooks during the retro, even if asked to "just do it" - finish the
-report, then the user can request application as a separate step.
+Write `~/.improve-clauding/reports/YYYY-MM-DD-retro-NN.md` following
+`references/report-template.md` exactly, including its writing rules.
+
+The report is for a human reader, so the internal vocabulary of this skill stops here.
+Do not write "axis", "attribution", "recurrence", "lens", "north star", "hard-fail",
+"zero-information retry" or field names from the inventory in the report. Translate them
+into plain sentences. Cap: 150 lines, 6 items to fix, 3 to keep. Rank and drop the rest;
+do not append everything you found.
+
+Proposals follow destinations.md and are listed once, at the end, one line each. Skill
+patches target the source directory, never a plugin cache. Do not apply anything. Do not
+edit CLAUDE.md, rules, skills, or hooks during the retro, even if asked to "just do it" -
+finish the report, then the user can request application as a separate step.
+
+Before saving, reread the draft as the user: if a sentence needs the skill's own
+terminology to parse, rewrite it.
 
 ### 8. Commit and present
 
@@ -141,9 +152,9 @@ report, then the user can request application as a separate step.
 python scripts/inventory.py --commit --report <report path>
 ```
 
-Then present to the user: the axis scores with deltas, the top 3 patterns to fix, the
-top 2 to endorse, hard-fail flags, and the numbered proposal list. Ask which proposals
-to apply. Do not paste the whole report.
+Then tell the user, in plain sentences and under 15 lines: the one thing most worth
+changing, the next two after it, the best thing they did, anything unsafe, and the
+numbered list of things you can set up. Link the report path. Do not paste the report.
 
 ## Token budget
 
@@ -169,6 +180,11 @@ budgets. Slices are capped at 10 sessions and 12 turns per session by the script
 - No recycled observations: a pattern already reported last time is listed under
   follow-through, not as new, unless its cause changed.
 - The user's tone is a locator for hot spots, not a finding.
+- Capped lists are floors, not counts. The inventory inspects at most 10 commits per
+  session and marks truncated lists with `+` or "capped". Never present a cap as a
+  measurement ("10 follow-up fixes, the highest in the window" is a bug, not a finding).
+- A shared-branch commit flag comes from the branch recorded at the commit call. If a
+  session started on `master` and moved to a feature branch, that is not a violation.
 - Sessions younger than 24h are marked outcome-pending; do not claim outcomes for them.
 - Cursor transcript format is unverified until the first file appears; if parsing yields
   zero turns for a Cursor file, report it as a gap and continue.

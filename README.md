@@ -75,6 +75,26 @@ Claude Code: the plugin is listed in the `vanillafairy` directory marketplace
 Cursor: `~/.cursor/plugins/local/vf-improve-clauding` is a directory junction to this
 folder, so both tools read the same files.
 
+## Report style
+
+The report is written for a human, so the skill's internal vocabulary stops at the
+report boundary. Words like "axis", "attribution", "recurrence" and inventory field
+names are banned from the page; findings are stated as sentences a person would say out
+loud, each with one real quote and one concrete thing to do differently. Caps: 150 lines,
+6 things to fix, 3 to keep. See `references/report-template.md`.
+
+## Measurement caveats the script handles for you
+
+- Token totals are deduplicated by message id (naive summing inflates them ~2x).
+- Prompt quality is scored only on *opening* prompts (session start, or after a 2h+
+  break). A terse follow-up inside a live thread is not a bad prompt.
+- Permission modes are counted once per turn; mode-switch events are reported separately.
+- Committing on a shared branch is judged by the branch recorded at the commit call, not
+  at session start.
+- Git follow-up fixes only count within 14 days of the session, and capped lists are
+  marked as floors rather than counts.
+- "Claude Code plan mode" is the IDE mode, not the planning skills; the slices say so.
+
 ## Design notes
 
 - Two layers: the script measures, the LLM classifies. Script flags are pointers, not findings.
