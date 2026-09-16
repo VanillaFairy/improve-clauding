@@ -51,7 +51,12 @@ python scripts/inventory.py --last 10
 python scripts/inventory.py --since 2026-09-01
 ```
 
-It prints the run dir with `inventory.md` (digest) and `inventory.json` (per-turn detail).
+It prints the run dir and the size of each file it wrote:
+
+- `summary.md` - totals and the session table. Shared. Read this.
+- `slice-{a,b,c,d}-*.md` - per-lens-group turn detail, disjoint. Each analyst reads one.
+- `inventory.json` - the full record. Never read whole; `excerpt.py` indexes it.
+
 If it reports 0 sessions, tell the user and stop. Do not re-implement the parsing in shell
 calls; if the script fails, fix the script.
 
@@ -61,7 +66,7 @@ the prompt-quality score are heuristics; treat them as pointers to read, not as 
 
 ### 2. Read context
 
-- `inventory.md` in full.
+- `summary.md`. Not the slices - the analysts own those - and not `inventory.json`.
 - Previous report: `python scripts/inventory.py --previous` prints its path. Read it if present.
 - `~/.improve-clauding/notes.md` if present (the user's own mid-work notes; highest-signal input).
 - `~/.claude/CLAUDE.md` and, for projects that appear in the inventory, their `CLAUDE.md` /
@@ -74,10 +79,22 @@ B orchestration, C correctness, D endorsement+trend). In Claude Code use the
 `lens-analyst` agent from this plugin; in Cursor use a general-purpose subagent with the
 same prompt. If subagents are unavailable, run the four groups sequentially yourself.
 
-Each analyst gets: the run dir path, its group letter, the paths of `axes.md` and
-`lenses.md`, the previous report path (group D), and the instruction to open session JSONL
-files around flagged timestamps for context. Budget: at most 10 sessions read in depth
-per analyst, chosen by `attention_score` (A, B, C) or `clean_candidate` (D).
+Each analyst gets exactly: its group letter, the path of its own slice file, the path of
+`summary.md`, the paths of `axes.md` and `lenses.md`, and the run dir (for `excerpt.py`).
+Nothing else. Do not paste slice contents into the prompt; pass paths.
+
+Context budget per analyst, enforced in the agent definition:
+
+- its slice (~3k tokens) + `summary.md` (~1.5k) + `axes.md` + `lenses.md` (~2.5k)
+- at most 15 `excerpt.py` calls, default cap 8000 chars each
+
+Never read a session `.jsonl` directly. The median transcript here is ~124k tokens and the
+largest is ~1.2M; one such read wrecks the retro. `excerpt.py` gives a bounded window:
+
+```
+python scripts/excerpt.py --run-dir <run dir> --ref 3/12 --ref 5/0
+python scripts/excerpt.py --run-dir <run dir> --ref 3/12 --context 1
+```
 
 Each analyst returns a list of candidate findings in this shape:
 
@@ -128,6 +145,23 @@ Then present to the user: the axis scores with deltas, the top 3 patterns to fix
 top 2 to endorse, hard-fail flags, and the numbered proposal list. Ask which proposals
 to apply. Do not paste the whole report.
 
+## Token budget
+
+The retro is itself judged on axis 1, so it stays cheap. Measured on a 20-session window:
+
+| stage | cost |
+|---|---|
+| orchestrator: `summary.md` + references + template | ~4k tokens |
+| each analyst: slice + summary + 2 references | ~7k tokens |
+| each analyst: up to 15 excerpts at 8k chars | up to ~30k tokens |
+| 4 analysts in parallel | ~28k shared + excerpt usage, in their own contexts |
+| orchestrator: 4 finding lists back | ~6k tokens |
+
+The whole retro should land under ~50k tokens in the main context. If a window is so large
+that `summary.md` exceeds ~10k tokens, split the retro by date range instead of raising
+budgets. Slices are capped at 10 sessions and 12 turns per session by the script; raise
+`SESSIONS_PER_SLICE` / `TURNS_PER_SESSION` in `inventory.py` only deliberately.
+
 ## Guardrails
 
 - Evidence or it did not happen: every pattern quotes a real turn with session id and timestamp.
@@ -139,3 +173,6 @@ to apply. Do not paste the whole report.
 - Cursor transcript format is unverified until the first file appears; if parsing yields
   zero turns for a Cursor file, report it as a gap and continue.
 - Reports contain code and paths; keep them under `~/.improve-clauding/`, never in a repo.
+- Token counts come from `usage` records deduplicated by message id; one API message is
+  written as several JSONL records that each repeat the full usage. Do not re-derive token
+  totals by summing records yourself - you will inflate them roughly 2x.

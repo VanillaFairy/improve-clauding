@@ -20,8 +20,10 @@ User habits it exposes: pasting instead of referencing paths; not delegating exp
 subagents; running one session past its topic; asking for restatements; verbose back-and-forth
 instead of one specified prompt.
 
-Caveat: JSONL output-token totals can be incomplete. Compare ratios and deltas between retros,
-not absolute cost.
+Caveat: JSONL output-token totals can be incomplete, and one API message is written as
+several records that each repeat the full `usage` - the inventory deduplicates by message
+id, so use its numbers rather than counting records. Compare ratios and deltas between
+retros, not absolute cost.
 
 ## Axis 2 - Actionable reusability
 

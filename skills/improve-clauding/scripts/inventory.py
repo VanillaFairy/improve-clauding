@@ -6,8 +6,15 @@ Discovers agent session transcripts (Claude Code + Cursor), selects the ones
 not yet covered by a previous retro, extracts per-session metrics and
 mechanical friction/success signals, and writes:
 
-  <run-dir>/inventory.json   full machine-readable inventory (per turn)
-  <run-dir>/inventory.md     compact digest the LLM reads first
+  <run-dir>/inventory.json   full machine-readable record (nobody reads it whole)
+  <run-dir>/summary.md       small shared digest: totals + session table
+  <run-dir>/slice-a-communication.md   per-lens-group slices, disjoint, bounded
+  <run-dir>/slice-b-orchestration.md
+  <run-dir>/slice-c-correctness.md
+  <run-dir>/slice-d-endorsement.md
+
+Each analyst reads summary.md + its own slice. Nothing reads a raw transcript;
+use excerpt.py for bounded windows around a flagged turn.
 
 The script never classifies. It only measures and flags. Stdlib only.
 
@@ -235,6 +242,9 @@ def parse_session(meta):
     Claude Code and (unverified) Cursor shapes."""
     path = Path(meta["path"])
     events = []  # dicts: kind, ts, ...
+    # One API message is written as several JSONL records (one per content block),
+    # each repeating the full usage. Count usage once per message id.
+    seen_msg_ids = set()
     misc = {"titles": [], "modes": Counter(), "permission_modes": Counter(), "cost_state": None,
             "version": None, "entrypoint": None, "cwd": None, "git_branch": None, "models": Counter(),
             "efforts": Counter(), "skills_attributed": Counter(), "compactions": 0, "hook_errors": 0,
@@ -330,7 +340,11 @@ def parse_session(meta):
             if role == "assistant" or t == "assistant":
                 if msg.get("model"):
                     misc["models"][msg["model"]] += 1
-                usage = msg.get("usage") if isinstance(msg.get("usage"), dict) else {}
+                mid = msg.get("id")
+                first_of_msg = mid is None or mid not in seen_msg_ids
+                if mid is not None:
+                    seen_msg_ids.add(mid)
+                usage = msg.get("usage") if (first_of_msg and isinstance(msg.get("usage"), dict)) else {}
                 thinking_chars = sum(len(b.get("thinking", "") or "") for b in blocks if b.get("type") == "thinking")
                 text_chars = sum(len(b.get("text", "") or "") for b in blocks if b.get("type") == "text")
                 tool_uses = []
@@ -347,7 +361,8 @@ def parse_session(meta):
                                "out": usage.get("output_tokens", 0) or 0,
                                "thinking_chars": thinking_chars, "text_chars": text_chars,
                                "tool_uses": tool_uses, "stop_reason": msg.get("stop_reason"),
-                               "sidechain": bool(rec.get("isSidechain")), "effort": rec.get("effort")})
+                               "sidechain": bool(rec.get("isSidechain")), "effort": rec.get("effort"),
+                               "msg_id": mid, "first_of_msg": first_of_msg})
                 continue
     return events, misc
 
@@ -358,7 +373,7 @@ def parse_session(meta):
 
 def analyze(meta, events, misc, now):
     prompts = [e for e in events if e["kind"] == "prompt"]
-    assistants = [e for e in events if e["kind"] == "assistant" and not e.get("sidechain")]
+    assistants = [e for e in events if e["kind"] == "assistant" and not e.get("sidechain") and e.get("first_of_msg", True)]
     results = [e for e in events if e["kind"] == "tool_result"]
     result_by_id = {r["tool_use_id"]: r for r in results if r.get("tool_use_id")}
     tss = sorted(e["ts"] for e in events if e.get("ts"))
@@ -455,7 +470,7 @@ def analyze(meta, events, misc, now):
             "quality": q,
             "agent_seconds": round(agent_seconds) if agent_seconds is not None else None,
             "human_wait_seconds": round(human_wait) if human_wait is not None else None,
-            "assistant_msgs": sum(1 for e in seg if e["kind"] == "assistant"),
+            "assistant_msgs": sum(1 for e in seg if e["kind"] == "assistant" and e.get("first_of_msg", True)),
             "tools": dict(tools.most_common(12)), "tool_errors": errors, "error_tools": dict(err_tools),
             "re_reads": re_reads, "sequential_readonly_runs": single_ro_seq, "delegations": delegations,
             "edit_churn_files": churn_files[:5], "commits": commits, "no_verify": no_verify, "force_push": force_push,
@@ -606,17 +621,41 @@ def save_state(app_home: Path, state):
 
 
 # ----------------------------------------------------------------------------
-# digest
+# outputs: one small shared summary + four disjoint per-group slices
 # ----------------------------------------------------------------------------
+
+SLICES = {
+    "a": ("communication", "A - prompt quality, instruction persistence, task decomposition"),
+    "b": ("orchestration", "B - delegation, wall-clock, session hygiene"),
+    "c": ("correctness", "C - verification, outcome, skill usage, safety"),
+    "d": ("endorsement", "D - endorsement and trend"),
+}
+TURNS_PER_SESSION = 12
+SESSIONS_PER_SLICE = 10
+
 
 def fmt_int(n):
     return f"{n:,}" if isinstance(n, (int, float)) and n is not None else "-"
 
 
-def write_digest(run_dir: Path, inv):
+def rule_files(cwd):
+    """Rule/convention files that exist for a session's project, for lens 2."""
+    out = []
+    g = HOME / ".claude" / "CLAUDE.md"
+    if g.is_file():
+        out.append(str(g))
+    if cwd and os.path.isdir(cwd):
+        for name in ("CLAUDE.md", "AGENTS.md", "CLAUDE.local.md", ".cursor/rules"):
+            p = Path(cwd) / name
+            if p.exists():
+                out.append(str(p))
+    return out
+
+
+def write_summary(run_dir: Path, inv):
     L = []
     s = inv["summary"]
-    L.append(f"# improve-clauding inventory - {inv['generated_at']}")
+    L.append(f"# improve-clauding summary - {inv['generated_at']}")
     L.append("")
     L.append(f"Selection: {inv['selection']}  |  sessions: {s['sessions']} (claude {s['by_tool'].get('claude',0)}, cursor {s['by_tool'].get('cursor',0)}, other {s['by_tool'].get('unknown',0)})  |  skipped trivial: {s['skipped_trivial']}")
     L.append(f"Previous retro: {inv['previous_retro'] or 'none'}  |  notes file: {inv['notes_path'] or 'none'}")
@@ -655,24 +694,6 @@ def write_digest(run_dir: Path, inv):
         title = short(x["title"] or x["first_prompt"], 70)
         L.append(f"| {n} | {x['tool']} | {when} | {x['duration_min'] or '-'} | {x['human_turns']} | {fmt_int(x['tokens']['out'])} | {mm['corrections']} | {mm['zero_info_retries']} | {mm['nudges']} | {mm['frustration_turns']} | {mm['tool_errors']} | {mm['delegations']} | {'y' if mm['plan_mode_used'] else ''} | {x['attention_score']} | {'y' if x['clean_candidate'] else ''} | {title} |")
     L.append("")
-    L.append("## Flagged turns (evidence pointers)")
-    L.append("")
-    L.append("Format: `[session#/turn#] flags | quality | quoted prompt`. Read the session JSONL around the timestamp for context.")
-    L.append("")
-    shown = 0
-    for n, x in enumerate(inv["sessions"]):
-        for t in x["turns"]:
-            f = [k for k, v in t["flags"].items() if v]
-            if not f:
-                continue
-            L.append(f"- [{n}/{t['i']}] {x['tool']} {t['ts']} {','.join(f)} | q{t['quality']['score']} errs{t['tool_errors']} | {short(t['text'], 200)}")
-            shown += 1
-            if shown >= 120:
-                break
-        if shown >= 120:
-            L.append("- ... truncated; see inventory.json")
-            break
-    L.append("")
     L.append("## Clean sessions (endorsement candidates)")
     for n, x in enumerate(inv["sessions"]):
         if x["clean_candidate"]:
@@ -684,23 +705,116 @@ def write_digest(run_dir: Path, inv):
             x = inv["sessions"][int(n)]
             L.append(f"- [{n}] {short(x['title'] or x['first_prompt'], 60)}: commits {len(g['commits_in_window'])}, reverted {g['reverted'] or 'none'}, follow-up fixes {len(g['follow_up_fixes'])}")
         L.append("")
-    L.append("## Per-session detail")
-    for n, x in enumerate(inv["sessions"]):
+    L.append("Per-turn detail is NOT here. Each lens group has its own slice file in this")
+    L.append("directory; read only yours. For a bounded window around one turn, run")
+    L.append("`python scripts/excerpt.py --run-dir <this dir> --ref <session#>/<turn#>`.")
+    (run_dir / "summary.md").write_text("\n".join(L), encoding="utf-8")
+
+
+def _slice_header(group, run_dir, inv):
+    name, title = SLICES[group]
+    L = [f"# improve-clauding slice {group.upper()} - {name}", "",
+         f"Lens group {title}. Generated {inv['generated_at']}.", "",
+         f"Shared context: `{run_dir / 'summary.md'}` (read it once; totals and the session table live there).",
+         f"This file holds only the turns relevant to group {group.upper()}, at most {TURNS_PER_SESSION} per session,",
+         f"for at most {SESSIONS_PER_SLICE} sessions. Session numbers `[n]` match summary.md.", "",
+         "To see what actually happened in a turn, do NOT read the transcript - it can be over",
+         "1M tokens. Run:", "",
+         f"    python scripts/excerpt.py --run-dir \"{run_dir}\" --ref <n>/<t>", "",
+         "It prints a bounded window (prompt, tool calls, errors) for that turn.", ""]
+    return L
+
+
+def _pick_sessions(inv, group):
+    ss = list(enumerate(inv["sessions"]))
+    if group == "d":
+        ss.sort(key=lambda p: (not p[1].get("clean_candidate"),
+                               -(p[1].get("mechanical", {}).get("praise_turns", 0)),
+                               p[1].get("attention_score", 0)))
+    return ss[:SESSIONS_PER_SLICE]
+
+
+def _pick_turns(x, group):
+    ts = x.get("turns", [])
+    if group == "a":
+        sel = [t for t in ts if any(t["flags"][k] for k in ("correction", "zero_info_retry", "near_repeat", "frustration"))
+               or (t["quality"]["score"] <= 1 and not t["flags"]["nudge"])]
+    elif group == "b":
+        sel = [t for t in ts if t["flags"]["nudge"] or t["flags"]["interrupted"] or t["delegations"]
+               or t["sequential_readonly_runs"] or (t["agent_seconds"] or 0) >= 180
+               or (t["human_wait_seconds"] or 0) >= 900]
+    elif group == "c":
+        sel = [t for t in ts if t["tool_errors"] or t["commits"] or t["edit_churn_files"]
+               or t["flags"]["praise"] or t["no_verify"] or t["force_push"]]
+    else:
+        sel = [t for t in ts if t["flags"]["praise"] or not any(t["flags"].values())]
+    return (sel or ts)[:TURNS_PER_SESSION], len(sel or ts)
+
+
+def write_slices(run_dir: Path, inv):
+    for group in SLICES:
+        L = _slice_header(group, run_dir, inv)
+        if group == "a":
+            L.append("Per turn: `t<i> <ts> [flags] q<score> <missing context elements> : prompt`.")
+            L.append("`missing` lists what the prompt lacked: path, error, code, criteria, intent.")
+        elif group == "b":
+            L.append("Per turn: agent seconds, human wait, assistant msgs, tools, delegations, sequential read-only runs.")
+        elif group == "c":
+            L.append("Per turn: tool errors by tool, commits, churned files, hard-fail flags. Git outcome per session.")
+        else:
+            L.append("Clean and praised sessions first. Per turn: quality, timing, tokens, prompt.")
         L.append("")
-        L.append(f"### [{n}] {x['tool']} {x['session_id']}")
-        L.append(f"- path: `{x['path']}`")
-        L.append(f"- project: {x['project_slug']} | cwd: {x['cwd']} | branch: {x['git_branch']} | models: {x['models']} | efforts: {x['efforts']} | perm: {x['permission_modes']}")
-        L.append(f"- {x['start']} -> {x['end']} (span {x.get('span_hours')} h; active {x['duration_min']} min; agent-active {round((x['agent_active_sec'] or 0)/60)} min; human-wait {round((x['human_wait_sec'] or 0)/60)} min; long gaps {x['long_gaps']}){'  OUTCOME PENDING (<24h)' if x['outcome_pending'] else ''}")
-        L.append(f"- tokens {x['tokens']} cache_ratio {x['cache_ratio']} thinking_chars {fmt_int(x['thinking_chars'])} lines +{x['lines_added']}/-{x['lines_removed']}")
-        L.append(f"- mechanical: {json.dumps(x['mechanical'])}")
-        L.append(f"- tools: {x['tools']}")
-        if x["skills_attributed"] or x["slash_commands"] or x["skill_tool_calls"]:
-            L.append(f"- skills: attributed {x['skills_attributed']} | Skill calls {x['skill_tool_calls']} | slash {x['slash_commands']}")
-        L.append("- turns:")
-        for t in x["turns"]:
-            f = ",".join(k for k, v in t["flags"].items() if v) or "-"
-            L.append(f"  - t{t['i']} {t['ts']} [{f}] q{t['quality']['score']} agent {t['agent_seconds']}s wait {t['human_wait_seconds']}s msgs {t['assistant_msgs']} errs {t['tool_errors']} deleg {t['delegations']} out {t['tokens']['out']}: {short(t['text'], 240)}")
-    (run_dir / "inventory.md").write_text("\n".join(L), encoding="utf-8")
+        if group == "d" and inv.get("previous_retro"):
+            L.append(f"Previous report (read it, build the follow-through table): `{inv['previous_retro']['report']}`")
+            L.append("")
+        if group == "c" and inv.get("skills_unseen"):
+            L.append("Installed skills unseen in this window: " + ", ".join(inv["skills_unseen"][:40]))
+            L.append("")
+        for n, x in _pick_sessions(inv, group):
+            if x.get("error"):
+                L.append(f"## [{n}] PARSE ERROR {x['session_id']}: {x['error']}")
+                continue
+            turns, total = _pick_turns(x, group)
+            mm = x["mechanical"]
+            L.append(f"## [{n}] {x['tool']} {x['session_id']} - {short(x['title'] or x['first_prompt'], 70)}")
+            if group == "a":
+                L.append(f"- {x['human_turns']} turns, avg quality {x['avg_prompt_quality']}/5, corrections {mm['corrections']}, zero-info retries {mm['zero_info_retries']}")
+                L.append(f"- rule files in force: {', '.join(rule_files(x['cwd'])) or 'none found'}")
+            elif group == "b":
+                L.append(f"- span {x.get('span_hours')} h, active {x['duration_min']} min, agent-active {round((x['agent_active_sec'] or 0)/60)} min, human-wait {round((x['human_wait_sec'] or 0)/60)} min, long gaps {x['long_gaps']}")
+                L.append(f"- delegations {mm['delegations']} (subagent files {mm['subagent_files']}), sequential read-only runs {mm['sequential_readonly_runs']}, compactions {mm['compactions']}, plan mode {mm['plan_mode_used']}")
+                L.append(f"- tools: {x['tools']}")
+            elif group == "c":
+                L.append(f"- tool errors {mm['tool_errors']}, denials {mm['denials']}, commits {mm['commits']}, churned files {mm['edit_churn_files'] or 'none'}, lines +{x['lines_added']}/-{x['lines_removed']}")
+                L.append(f"- hard-fail: --no-verify {mm['no_verify']}, force-push {mm['force_push']}, commits on {x['git_branch']} {mm['on_main_with_commits']}")
+                L.append(f"- skills attributed: {x['skills_attributed'] or 'none'}")
+                g = inv.get("git", {}).get(str(n))
+                if g:
+                    L.append(f"- git: commits {[c['hash'] for c in g['commits_in_window']]}, reverted {g['reverted'] or 'none'}, follow-up fixes {[f['hash'] for f in g['follow_up_fixes']] or 'none'}")
+                if x["outcome_pending"]:
+                    L.append("- OUTCOME PENDING (<24h old): do not claim outcomes for this session")
+            else:
+                L.append(f"- {x['human_turns']} turns, active {x['duration_min']} min, out {fmt_int(x['tokens']['out'])} tok, cache ratio {x['cache_ratio']}, praise {mm['praise_turns']}, corrections {mm['corrections']}, clean {x['clean_candidate']}")
+                L.append(f"- delegations {mm['delegations']}, commits {mm['commits']}, lines +{x['lines_added']}/-{x['lines_removed']}, skills {x['skills_attributed'] or 'none'}")
+            if total > len(turns):
+                L.append(f"- showing {len(turns)} of {total} relevant turns (excerpt.py for the rest)")
+            for t in turns:
+                f = ",".join(k for k, v in t["flags"].items() if v) or "-"
+                if group == "a":
+                    q = t["quality"]
+                    missing = ",".join(k for k in ("path", "error", "code", "criteria", "intent")
+                                       if not q.get({"path": "has_path", "error": "has_error_text", "code": "has_code",
+                                                     "criteria": "has_criteria", "intent": "has_intent"}[k])) or "-"
+                    L.append(f"  - t{t['i']} {t['ts']} [{f}] q{q['score']} missing:{missing} : {short(t['text'], 240)}")
+                elif group == "b":
+                    L.append(f"  - t{t['i']} {t['ts']} [{f}] agent {t['agent_seconds']}s wait {t['human_wait_seconds']}s msgs {t['assistant_msgs']} deleg {t['delegations']} seqRO {t['sequential_readonly_runs']} tools {t['tools']} : {short(t['text'], 80)}")
+                elif group == "c":
+                    L.append(f"  - t{t['i']} {t['ts']} [{f}] errs {t['tool_errors']}{' ' + str(t['error_tools']) if t['error_tools'] else ''} commits {t['commits']} churn {t['edit_churn_files'] or '-'} tools {t['tools']} : {short(t['text'], 120)}")
+                else:
+                    L.append(f"  - t{t['i']} {t['ts']} [{f}] q{t['quality']['score']} agent {t['agent_seconds']}s msgs {t['assistant_msgs']} out {t['tokens']['out']} deleg {t['delegations']} : {short(t['text'], 200)}")
+            L.append("")
+        name = SLICES[group][0]
+        (run_dir / f"slice-{group}-{name}.md").write_text("\n".join(L), encoding="utf-8")
 
 
 # ----------------------------------------------------------------------------
@@ -872,11 +986,14 @@ def main(argv=None):
     run_dir = app_home / "runs" / now.strftime("%Y%m%d-%H%M%S")
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "inventory.json").write_text(json.dumps(inv, indent=1, default=str), encoding="utf-8")
-    write_digest(run_dir, inv)
+    write_summary(run_dir, inv)
+    write_slices(run_dir, inv)
     if not a.quiet:
         print(f"sessions: {len(sessions)} ({selection}); skipped trivial: {skipped}")
-        print(f"digest:  {run_dir / 'inventory.md'}")
-        print(f"json:    {run_dir / 'inventory.json'}")
+        print(f"run dir: {run_dir}")
+        for p in sorted(run_dir.glob("*.md")):
+            print(f"  {p.name:34} {p.stat().st_size // 1024:>4} KB")
+        print(f"  {'inventory.json':34} {(run_dir / 'inventory.json').stat().st_size // 1024:>4} KB  (full record; use excerpt.py, do not read whole)")
         if notes.is_file():
             print(f"notes:   {notes}")
         if state["retros"]:

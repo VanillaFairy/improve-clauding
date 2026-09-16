@@ -13,8 +13,9 @@ automatically.
 
 ```
 skills/improve-clauding/
-  SKILL.md                 orchestrator (8-step workflow)
+  SKILL.md                 orchestrator (8-step workflow) + token budget
   scripts/inventory.py     deterministic pre-pass: discovery, metrics, flags, state (stdlib Python 3)
+  scripts/excerpt.py       bounded window into one turn; the only way to touch a transcript
   references/axes.md       what "improve" means; per-axis signals; tensions; north star
   references/lenses.md     12 lenses in 4 analyst groups; attribution; root-cause step; ranking
   references/destinations.md  rule / skill / agent / hook decision and proposal format
@@ -36,12 +37,31 @@ commands/improve-clauding.md   /vf-improve-clauding:improve-clauding
 ## State
 
 `~/.improve-clauding/state.json` records covered sessions and past retros.
-`runs/<timestamp>/` holds `inventory.md` + `inventory.json` per pre-pass.
+Each pre-pass writes `runs/<timestamp>/` containing `summary.md` (~5 KB),
+four disjoint `slice-*.md` files (8-15 KB each), and `inventory.json` (the full record).
 
 ```
 python skills/improve-clauding/scripts/inventory.py --status
 python skills/improve-clauding/scripts/inventory.py --last 10 --no-git
+python skills/improve-clauding/scripts/excerpt.py --run-dir <run> --ref 3/12
 ```
+
+## Token discipline
+
+The retro is judged on its own axis 1, so context is budgeted rather than trusted:
+
+- The shared digest is small (`summary.md`, ~1.5k tokens) and carries no turn detail.
+- Turn detail is split into four **disjoint** slices, one per lens group, so four analysts
+  cost about what one would - not 4x the same 17k-token digest.
+- Transcripts are never read. They run from ~124k to ~1.2M tokens each. `excerpt.py`
+  prints a hard-capped window (prompt, tool calls, error bodies) for one turn.
+- Slices are capped at 10 sessions x 12 turns; `excerpt.py` at 8000 chars per call,
+  15 calls per analyst.
+- Whole retro target: under ~50k tokens in the main context.
+
+Token totals are deduplicated by message id: Claude Code writes one JSONL record per
+content block and repeats the full `usage` in each, so naive summing inflates output
+tokens about 2x.
 
 ## Install
 
