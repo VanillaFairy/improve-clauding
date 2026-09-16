@@ -9,7 +9,32 @@ follow-through on the previous retro's recommendations, and a numbered list of p
 (personal/project rules, skill patches, new skills, agents, hooks). Nothing is applied
 automatically.
 
-## Layout
+## Install
+
+Claude Code: the plugin is listed in the `vanillafairy` directory marketplace
+(`c:\work\claude\vanillafairy\.claude-plugin\marketplace.json`):
+
+```
+/plugin install improve-clauding@vanillafairy
+```
+
+Cursor: `~/.cursor/plugins/local/improve-clauding` is a directory junction to this
+folder, so both tools read the same files.
+
+## Usage
+
+```
+/improve-clauding:improve-clauding
+```
+
+That's it. No arguments needed - it covers everything since your last retro.
+
+Optional: a number for the last N sessions (`10`), `--since 2026-09-01`, `--all`, or
+lens words to run only one analyst group (`prompts`, `delegation`, `skills`, `endorse`).
+
+## Elaboration
+
+### Layout
 
 ```
 skills/improve-clauding/
@@ -24,7 +49,7 @@ agents/lens-analyst.md     read-only analyst subagent, one per lens group
 commands/improve-clauding.md   /improve-clauding:improve-clauding
 ```
 
-## Inputs
+### Inputs
 
 - `~/.claude/projects/**/*.jsonl` (main sessions; `subagents/` counted for delegation)
 - `~/.cursor/projects/*/agent-transcripts/*.jsonl` (parser is shape-tolerant; format unverified until first file)
@@ -34,7 +59,7 @@ commands/improve-clauding.md   /improve-clauding:improve-clauding
 - `~/.improve-clauding/notes.md` - your own notes between retros (optional, high signal)
 - previous reports in `~/.improve-clauding/reports/`
 
-## State
+### State
 
 `~/.improve-clauding/state.json` records covered sessions and past retros.
 Each pre-pass writes `runs/<timestamp>/` containing `summary.md` (~5 KB),
@@ -46,7 +71,7 @@ python skills/improve-clauding/scripts/inventory.py --last 10 --no-git
 python skills/improve-clauding/scripts/excerpt.py --run-dir <run> --ref 3/12
 ```
 
-## Token discipline
+### Token discipline
 
 The retro is judged on its own axis 1, so context is budgeted rather than trusted:
 
@@ -63,19 +88,7 @@ Token totals are deduplicated by message id: Claude Code writes one JSONL record
 content block and repeats the full `usage` in each, so naive summing inflates output
 tokens about 2x.
 
-## Install
-
-Claude Code: the plugin is listed in the `vanillafairy` directory marketplace
-(`c:\work\claude\vanillafairy\.claude-plugin\marketplace.json`):
-
-```
-/plugin install improve-clauding@vanillafairy
-```
-
-Cursor: `~/.cursor/plugins/local/improve-clauding` is a directory junction to this
-folder, so both tools read the same files.
-
-## Report style
+### Report style
 
 The report is written for a human, so the skill's internal vocabulary stops at the
 report boundary. Words like "axis", "attribution", "recurrence" and inventory field
@@ -83,7 +96,7 @@ names are banned from the page; findings are stated as sentences a person would 
 loud, each with one real quote and one concrete thing to do differently. Caps: 150 lines,
 6 things to fix, 3 to keep. See `references/report-template.md`.
 
-## Measurement caveats the script handles for you
+### Measurement caveats the script handles for you
 
 - Spend is estimated from token usage at list prices, because Claude Code's own
   `cost-state` field is almost always absent or zero (2 nonzero records in a 92-session
@@ -102,7 +115,7 @@ loud, each with one real quote and one concrete thing to do differently. Caps: 1
   marked as floors rather than counts.
 - "Claude Code plan mode" is the IDE mode, not the planning skills; the slices say so.
 
-## Design notes
+### Design notes
 
 - Two layers: the script measures, the LLM classifies. Script flags are pointers, not findings.
 - Every finding: lens, axis moved, axis cost, attribution, recurrence, quoted evidence.
