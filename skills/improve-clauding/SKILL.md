@@ -60,6 +60,16 @@ It prints the run dir and the size of each file it wrote:
 If it reports 0 sessions, tell the user and stop. Do not re-implement the parsing in shell
 calls; if the script fails, fix the script.
 
+Before continuing, check whether the selected material is genuinely newer than the previous
+retro. A copied, resumed, or re-indexed session is not new when its useful turns were already
+reviewed. If an old session has only a later outcome, mention that outcome separately; do not
+count the session again or use its old turns to judge whether the user followed later advice.
+Evidence of follow-through must be newer than the advice.
+
+If no new work remains after this check, tell the user: "No big changes since last time."
+Add one plain sentence about any important later outcome, then stop. Do not write or commit
+another report.
+
 The script measures and flags. It does not classify. Flags (`correction`,
 `zero_info_retry`, `nudge`, `frustration`, `praise`, `near_repeat`, `interrupted`) and
 the prompt-quality score are heuristics; treat them as pointers to read, not as findings.
@@ -153,6 +163,14 @@ finish the report, then the user can request application as a separate step.
 Before saving, reread the draft as the user: if a sentence needs the skill's own
 terminology to parse, rewrite it.
 
+Use language that a person would use in a normal work conversation. Never expose process
+terms such as "eligible sessions", "coverage window", "selection cutoff", "follow-through
+evidence", or "outcome update". Describe what happened instead:
+
+- "No big changes since last time", not "No new eligible sessions."
+- "I cannot tell yet whether you tried this", not "There is no post-retro evidence."
+- "An older task needed one later cleanup", not "A covered session has a new outcome."
+
 ### 8. Commit and present
 
 ```
@@ -193,8 +211,10 @@ budgets. Slices are capped at 10 sessions and 12 turns per session by the script
 - A shared-branch commit flag comes from the branch recorded at the commit call. If a
   session started on `master` and moved to a feature branch, that is not a violation.
 - Sessions younger than 24h are marked outcome-pending; do not claim outcomes for them.
-- Cursor transcript format is unverified until the first file appears; if parsing yields
-  zero turns for a Cursor file, report it as a gap and continue.
+- Cursor transcripts record prompts, assistant messages, tool calls, and failed turns. They
+  do not currently record token usage, exact assistant timing, or tool results. Treat those
+  values as unavailable, never as zero. If parsing yields zero turns, report the gap and
+  continue.
 - Reports contain code and paths; keep them under `~/.improve-clauding/`, never in a repo.
 - Token counts come from `usage` records deduplicated by message id; one API message is
   written as several JSONL records that each repeat the full usage. Do not re-derive token

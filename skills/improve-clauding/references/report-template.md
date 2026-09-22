@@ -8,10 +8,14 @@ Not a scoring system. Not another agent.
 ## Writing rules
 
 - Plain English. Short sentences. One idea per sentence.
+- Write as a person speaking to another person. Describe the work, not the reporting
+  process. Say "No big changes since last time", not "No new eligible sessions". Say
+  "I cannot tell yet whether you tried this", not "There is no post-retro evidence".
 - Never print the internal vocabulary. The words `axis`, `axis moved`, `axis cost`,
   `attribution`, `recurrence`, `lens`, `north star`, `systemic`, `mechanical`,
-  `endorsement`, `hard-fail`, `zero-information retry`, `clean_candidate` are for
-  thinking, not for the page. Say what they mean instead:
+  `endorsement`, `hard-fail`, `zero-information retry`, `clean_candidate`, `eligible
+  sessions`, `coverage window`, `selection cutoff`, `follow-through evidence`, and
+  `outcome update` are for thinking, not for the page. Say what they mean instead:
   - "axis moved: tokens" -> "This cost you about $N."
   - "attribution: agent" -> "This one is on Claude, not you."
   - "attribution: user" -> "This one is a habit worth changing."
