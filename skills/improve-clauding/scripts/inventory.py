@@ -89,6 +89,9 @@ INJECTED_TAG_RE = re.compile(
 CURSOR_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.S | re.I)
 CURSOR_TIMESTAMP_RE = re.compile(r"<timestamp>\s*(.*?)\s*</timestamp>", re.S | re.I)
 CURSOR_SLASH_RE = re.compile(r"^\s*(/[\w:.\-]+)\b")
+MODEL_DATE_SUFFIX_RE = re.compile(r"-\d{6,8}$")
+BIG_TOOL_OUTPUT_CHARS = 10000   # a tool result at or above this is a context dump
+
 GIT_COMMIT_RE = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?commit\b")
 NO_VERIFY_RE = re.compile(r"--no-verify\b")
 FORCE_PUSH_RE = re.compile(r"\bgit\s+push\b[^\n]*\s(--force|-f)\b")
@@ -206,6 +209,23 @@ def prompt_quality(text):
     return q
 
 
+def short_model(model):
+    """claude-opus-4-1-20250805 -> claude-opus-4-1; keeps the table narrow."""
+    return MODEL_DATE_SUFFIX_RE.sub("", str(model or "").strip()) or "-"
+
+
+def top_key(counts):
+    """Most common key of a {value: count} mapping, or None when empty."""
+    return Counter(counts or {}).most_common(1)[0][0] if counts else None
+
+
+def short_chars(n):
+    """41234 -> '41k'. '?' when the transcript does not record the size."""
+    if n is None:
+        return "?"
+    return f"{round(n / 1000)}k" if n >= 1000 else str(n)
+
+
 def similarity(a, b):
     """Jaccard over word sets; good enough to flag near-repeat prompts."""
     wa, wb = set(re.findall(r"\w+", a.lower())), set(re.findall(r"\w+", b.lower()))
@@ -268,7 +288,7 @@ def scan_usage(paths):
                 if not isinstance(u, dict):
                     continue
                 calls += 1
-                by_fam[model_family(m.get("model"))].update({
+                by_fam[usage_family_key(m.get("model"))].update({
                     "in": u.get("input_tokens", 0) or 0,
                     "out": u.get("output_tokens", 0) or 0,
                     "cache_write": u.get("cache_creation_input_tokens", 0) or 0,
@@ -468,7 +488,7 @@ def parse_session(meta):
                     seen_msg_ids.add(mid)
                 usage = msg.get("usage") if (first_of_msg and isinstance(msg.get("usage"), dict)) else {}
                 if usage:
-                    misc["usage_by_family"][model_family(msg.get("model"))].update({
+                    misc["usage_by_family"][usage_family_key(msg.get("model"))].update({
                         "in": usage.get("input_tokens", 0) or 0,
                         "out": usage.get("output_tokens", 0) or 0,
                         "cache_write": usage.get("cache_creation_input_tokens", 0) or 0,
@@ -520,6 +540,7 @@ def analyze(meta, events, misc, now):
     timing_available = bool(prompts and any(e.get("ts") for e in assistants))
     usage_available = meta["tool"] != "cursor" or bool(misc["usage_by_family"])
     tool_results_available = meta["tool"] != "cursor" or bool(results)
+    compactions_available = meta["tool"] != "cursor"
     # active duration: sum of inter-event gaps, ignoring idle gaps over 60 min
     active_sec = (sum(min((b - a_).total_seconds(), 3600)
                       for a_, b in zip(tss, tss[1:])
@@ -542,6 +563,13 @@ def analyze(meta, events, misc, now):
         single_ro_seq = 0  # consecutive assistant turns with exactly one read-only tool
         prev_single_ro = False
         delegations = 0
+        parallel_delegations = 0
+        seq_delegation_runs = 0
+        prev_single_delegate = False
+        max_tools_per_msg = 0
+        multi_tool_msgs = 0
+        tool_result_chars = 0
+        big_tool_outputs = 0
         edits = Counter()
         commits = 0
         commit_branches = set()
@@ -591,6 +619,21 @@ def analyze(meta, events, misc, now):
                 if is_single_ro and prev_single_ro:
                     single_ro_seq += 1
                 prev_single_ro = is_single_ro
+                # batching: one message carrying several tools is a parallel batch
+                max_tools_per_msg = max(max_tools_per_msg, len(names))
+                if len(names) > 1:
+                    multi_tool_msgs += 1
+                n_delegates = sum(1 for nm in names if nm in DELEGATE_TOOLS)
+                if n_delegates > 1:
+                    parallel_delegations += n_delegates
+                is_single_delegate = n_delegates == 1
+                if is_single_delegate and prev_single_delegate:
+                    seq_delegation_runs += 1
+                prev_single_delegate = is_single_delegate
+            elif e["kind"] == "tool_result":
+                tool_result_chars += e.get("chars", 0) or 0
+                if (e.get("chars", 0) or 0) >= BIG_TOOL_OUTPUT_CHARS:
+                    big_tool_outputs += 1
             elif e["kind"] == "interrupt":
                 interrupts += 1
             elif e["kind"] == "turn_error":
@@ -627,6 +670,10 @@ def analyze(meta, events, misc, now):
             "assistant_msgs": sum(1 for e in seg if e["kind"] == "assistant" and e.get("first_of_msg", True)),
             "tools": dict(tools.most_common(12)), "tool_errors": errors, "error_tools": dict(err_tools),
             "re_reads": re_reads, "sequential_readonly_runs": single_ro_seq, "delegations": delegations,
+            "parallel_delegations": parallel_delegations, "sequential_delegation_runs": seq_delegation_runs,
+            "max_tools_per_message": max_tools_per_msg, "multi_tool_messages": multi_tool_msgs,
+            "tool_result_chars": tool_result_chars if tool_results_available else None,
+            "big_tool_outputs": big_tool_outputs if tool_results_available else None,
             "edit_churn_files": churn_files[:5], "commits": commits, "commit_branches": sorted(commit_branches),
             "no_verify": no_verify, "force_push": force_push,
             "turn_failures": turn_failures, "turn_failure_reasons": dict(turn_failure_reasons),
@@ -689,7 +736,11 @@ def analyze(meta, events, misc, now):
         for fam, u in src.items():
             combined[fam].update({k: v for k, v in u.items() if k != "calls"})
     combined = {k: dict(v) for k, v in combined.items()}
-    cost_main, cost_sub = estimate_cost(main_fam), estimate_cost(sub_fam)
+    cost_main, unpriced_main = estimate_cost(main_fam)
+    cost_sub, unpriced_sub = estimate_cost(sub_fam)
+    unpriced = Counter(unpriced_main)
+    unpriced.update(unpriced_sub)
+    cost_partial = bool(unpriced)
     ctx_read = sum(u.get("cache_read", 0) + u.get("in", 0) for u in combined.values())
     all_calls = main_calls + sub_calls
     spend = {
@@ -697,6 +748,9 @@ def analyze(meta, events, misc, now):
         "est_cost_usd": round(cost_main + cost_sub, 2),
         "est_cost_main_usd": cost_main,
         "est_cost_subagents_usd": cost_sub,
+        "cost_partial": cost_partial,
+        "unpriced_families": sorted(unpriced),
+        "unpriced_tokens": sum(unpriced.values()),
         "api_calls": all_calls, "api_calls_main": main_calls, "api_calls_subagents": sub_calls,
         "context_read_tokens": ctx_read,
         "avg_context_per_call": round(ctx_read / all_calls) if all_calls else 0,
@@ -717,8 +771,16 @@ def analyze(meta, events, misc, now):
         "turn_failure_reasons": dict(misc["turn_errors"]),
         "re_read_turns": sum(1 for t in turns if t["re_reads"]),
         "sequential_readonly_runs": sum(t["sequential_readonly_runs"] for t in turns),
+        "max_tools_per_message": max([t["max_tools_per_message"] for t in turns] or [0]),
+        "multi_tool_messages": sum(t["multi_tool_messages"] for t in turns),
+        "tool_output_chars": (sum(t["tool_result_chars"] or 0 for t in turns)
+                              if tool_results_available else None),
+        "big_tool_outputs": (sum(t["big_tool_outputs"] or 0 for t in turns)
+                             if tool_results_available else None),
         "edit_churn_files": sorted({f for t in turns for f in t["edit_churn_files"]})[:8],
         "delegations": sum(t["delegations"] for t in turns),
+        "parallel_delegations": sum(t["parallel_delegations"] for t in turns),
+        "sequential_delegation_runs": sum(t["sequential_delegation_runs"] for t in turns),
         "subagent_files": meta.get("subagent_files", 0),
         "commits": sum(t["commits"] for t in turns),
         "no_verify": sum(t["no_verify"] for t in turns),
@@ -732,6 +794,8 @@ def analyze(meta, events, misc, now):
         "refusals": misc["refusals"],
         "plan_mode_used": plan_used,
         "openers": len(openers),
+        # 2+ means the session carried more than one separate brief
+        "briefs_in_session": sum(1 for t in turns if t.get("is_opener")),
         "low_quality_openers": sum(1 for t in openers if t["quality"]["score"] <= 1 and not t["flags"]["nudge"]),
     }
     # heuristic attention score: how much this session deserves LLM reading
@@ -772,6 +836,10 @@ def analyze(meta, events, misc, now):
             "usage": usage_available,
             "exact_timing": timing_available,
             "tool_results": tool_results_available,
+            # compaction markers are Claude-Code record shapes; Cursor emits none,
+            # so a 0 there means "not recorded", not "context never compacted"
+            "compactions": compactions_available,
+            "pricing": not cost_partial,
             "model": bool(misc["models"]),
             "cwd": bool(misc["cwd"]),
         },
@@ -792,25 +860,45 @@ PRICES = {
     "sonnet": (3.0, 15.0, 3.75, 0.30),
     "haiku":  (0.80, 4.0, 1.0, 0.08),
 }
-DEFAULT_FAMILY = "sonnet"
 
 
 def model_family(model):
+    """Priced family for a model string, or None when we have no list price.
+
+    Composer, GPT, Grok, Gemini and Fable are not in PRICES. Falling back to a
+    default family would bill them at that family's rate and hide the gap.
+    """
     m = (model or "").lower()
     for k in PRICES:
         if k in m:
             return k
-    return DEFAULT_FAMILY
+    return None
+
+
+def usage_family_key(model):
+    """Bucket key for usage: the priced family, else the raw model string."""
+    return model_family(model) or (str(model).strip() if model else "unknown")
 
 
 def estimate_cost(usage_by_family):
-    """usage_by_family: {family: {'in','out','cache_write','cache_read'}} -> USD."""
+    """usage_by_family: {family: {'in','out','cache_write','cache_read'}}.
+
+    Returns (usd, unpriced) where unpriced maps each skipped bucket key to the
+    token count it held. Unpriced buckets contribute nothing to the total; no
+    price is guessed for them.
+    """
     total = 0.0
+    unpriced = {}
     for fam, u in usage_by_family.items():
-        pi, po, pw, pr = PRICES.get(fam, PRICES[DEFAULT_FAMILY])
+        price = PRICES.get(fam)
+        if price is None:
+            tokens = sum(u.get(k, 0) or 0 for k in ("in", "out", "cache_write", "cache_read"))
+            unpriced[fam] = unpriced.get(fam, 0) + tokens
+            continue
+        pi, po, pw, pr = price
         total += (u.get("in", 0) * pi + u.get("out", 0) * po
                   + u.get("cache_write", 0) * pw + u.get("cache_read", 0) * pr) / 1e6
-    return round(total, 2)
+    return round(total, 2), unpriced
 
 
 GIT_SCAN_LIMIT = 10        # commits inspected per session; lists are labelled when hit
@@ -946,6 +1034,9 @@ def write_summary(run_dir: Path, inv):
         L.append(f"- measured API calls {fmt_int(sp['api_calls'])} ({fmt_int(sp['api_calls_main'])} main + {fmt_int(sp['api_calls_subagents'])} subagent), each re-reading {fmt_int(sp['avg_context_per_call'])} tokens of context on average")
         L.append(f"- measured context re-read across all calls: {fmt_int(sp['context_read_tokens'])} tokens. This, not output, is where the money goes.")
         L.append(f"- measured output {fmt_int(s['tokens']['out'])}, cache_create {fmt_int(s['tokens']['cache_create'])}, uncached in {fmt_int(s['tokens']['in'])} (main sessions only)")
+    if s.get("unpriced_models"):
+        L.append(f"- COST PARTIAL: no list price for {', '.join(s['unpriced_models'])}; "
+                 "those tokens are excluded from every dollar figure")
     if coverage.get("usage_unknown", 0) < s["sessions"]:
         L.append("  Do NOT read a high cache ratio as efficiency: it means each call was cheap per token,")
         L.append("  not that there were few calls or small contexts. Cost = calls x context size.")
@@ -955,11 +1046,28 @@ def write_summary(run_dir: Path, inv):
     L.append(f"- corrections {m['corrections']}, zero-info retries {m['zero_info_retries']}, nudges {m['nudges']}, frustration turns {m['frustration_turns']}, praise turns {m['praise_turns']}, interrupts {m['interrupts']}, failed agent turns {m['turn_failures']}")
     result_note = (f"; tool-result status unavailable for {coverage.get('tool_results_unknown', 0)} session(s)"
                    if coverage.get("tool_results_unknown") else "")
-    L.append(f"- measured tool errors {m['tool_errors']}, re-read turns {m['re_read_turns']}, sequential read-only runs {m['sequential_readonly_runs']}, compactions {m['compactions']}, denials {m['denials']}{result_note}")
-    L.append(f"- delegations {m['delegations']} (subagent files {m['subagent_files']}), commits {m['commits']}, --no-verify {m['no_verify']}, force-push {m['force_push']}, sessions committing on a shared branch {m['on_main_with_commits']}")
+    compactions_unknown = coverage.get("compactions_unknown", 0)
+    if s["sessions"] and compactions_unknown == s["sessions"]:
+        compactions_txt = "compactions unavailable for these transcripts (no compaction records in this format)"
+    elif compactions_unknown:
+        compactions_txt = f"compactions {m['compactions']} (unavailable for {compactions_unknown} session(s))"
+    else:
+        compactions_txt = f"compactions {m['compactions']}"
+    L.append(f"- measured tool errors {m['tool_errors']}, re-read turns {m['re_read_turns']}, sequential read-only runs {m['sequential_readonly_runs']}, {compactions_txt}, denials {m['denials']}{result_note}")
+    if s["sessions"] and coverage.get("tool_results_unknown", 0) == s["sessions"]:
+        L.append("- tool-output size unavailable for these transcripts")
+    else:
+        L.append(f"- measured tool output {fmt_int(m['tool_output_chars'])} chars, of which {m['big_tool_outputs']} single results >= {fmt_int(BIG_TOOL_OUTPUT_CHARS)} chars{result_note}")
+    L.append(f"- tool batching: largest single message held {m['max_tools_per_message']} tool calls; {m['multi_tool_messages']} messages carried more than one")
+    L.append(f"- delegations {m['delegations']} ({m['parallel_delegations']} in parallel batches, {m['sequential_delegation_runs']} sequential run-ons; subagent files {m['subagent_files']}), commits {m['commits']}, --no-verify {m['no_verify']}, force-push {m['force_push']}, sessions committing on a shared branch {m['on_main_with_commits']}")
     L.append(f"- sessions using an IDE plan mode {m['plan_mode_sessions']} (planning *skills* are in the list below)")
     L.append(f"- opening prompts {m['openers']} of {s['human_turns']} turns; average brief quality {s['avg_prompt_quality']} / 5; thin briefs {m['low_quality_openers']}")
     L.append("  (quality is scored only on opening prompts - a terse follow-up inside a live thread is not a bad prompt)")
+    L.append("")
+    L.append("## Models and effort")
+    L.append("- models (full string x assistant messages): " + (", ".join(f"{k} {v}" for k, v in s.get("models", {}).items()) or "-"))
+    L.append("- effort levels: " + (", ".join(f"{k} {v}" for k, v in s.get("efforts", {}).items()) or "-"))
+    L.append("  (an empty effort list means the transcript never records one, not that effort was default)")
     L.append("")
     L.append("## Tool mix")
     L.append(", ".join(f"{k} {v}" for k, v in s["tools"].items()) or "-")
@@ -971,15 +1079,18 @@ def write_summary(run_dir: Path, inv):
     L.append("- installed but unseen (skills dir names): " + (", ".join(inv["skills_unseen"][:40]) or "-"))
     L.append("")
     L.append("## Repeated prompt openers (>=2 sessions)")
-    for k, v in inv["repeated_openers"][:15]:
-        L.append(f"- x{v}: {k}")
+    for k, session_count, occurrences in inv["repeated_openers"][:15]:
+        L.append(f"- {session_count} sessions, {occurrences} times: {k}")
     if not inv["repeated_openers"]:
         L.append("- none")
     L.append("")
     L.append("## Sessions (sorted by attention score)")
     L.append("")
-    L.append("| # | tool | when | min | turns | est $ | calls | corr | 0-info | nudge | frust | errs | deleg | attn | clean | title / first prompt |")
-    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
+    L.append("`model`/`effort` are the most common value in that session, release-date suffix stripped. "
+             "`briefs` is how many separate task briefs the session carried (2+ = more than one job in one thread).")
+    L.append("")
+    L.append("| # | tool | model | effort | when | min | turns | briefs | est $ | calls | corr | 0-info | nudge | frust | errs | deleg | attn | clean | title / first prompt |")
+    L.append("|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|")
     for n, x in enumerate(inv["sessions"]):
         mm = x["mechanical"]
         xsp = x.get("spend", {})
@@ -988,9 +1099,17 @@ def write_summary(run_dir: Path, inv):
         title = short(x["title"] or x["first_prompt"], 70)
         duration = x["duration_min"] if caps.get("exact_timing", True) else "-"
         cost = f"{xsp.get('est_cost_usd', 0):,.0f}" if caps.get("usage", True) else "-"
+        if xsp.get("cost_partial"):
+            cost += "*"
         calls = fmt_int(xsp.get("api_calls", 0)) if caps.get("usage", True) else "-"
         errors = mm["tool_errors"] if caps.get("tool_results", True) else "-"
-        L.append(f"| {n} | {x['tool']} | {when} | {duration} | {x['human_turns']} | {cost} | {calls} | {mm['corrections']} | {mm['zero_info_retries']} | {mm['nudges']} | {mm['frustration_turns']} | {errors} | {mm['delegations']} | {x['attention_score']} | {'y' if x['clean_candidate'] else ''} | {title} |")
+        model = short_model(top_key(x.get("models"))) if x.get("models") else "-"
+        effort = top_key(x.get("efforts")) or "-"
+        briefs = mm.get("briefs_in_session", "-")
+        L.append(f"| {n} | {x['tool']} | {model} | {effort} | {when} | {duration} | {x['human_turns']} | {briefs} | {cost} | {calls} | {mm['corrections']} | {mm['zero_info_retries']} | {mm['nudges']} | {mm['frustration_turns']} | {errors} | {mm['delegations']} | {x['attention_score']} | {'y' if x['clean_candidate'] else ''} | {title} |")
+    if any(x.get("spend", {}).get("cost_partial") for x in inv["sessions"]):
+        L.append("")
+        L.append("`*` on est $ = that session ran an unpriced model; its tokens are not in the figure.")
     L.append("")
     L.append("## Clean sessions (endorsement candidates)")
     for n, x in enumerate(inv["sessions"]):
@@ -1069,8 +1188,12 @@ def write_slices(run_dir: Path, inv):
             L.append("out if it is a retry that never says what went wrong.")
         elif group == "b":
             L.append("Per turn: agent seconds, human wait, assistant msgs, tools, delegations, sequential read-only runs.")
+            L.append("`deleg N/Ppar/Sseq`: N delegate calls, P of them issued in a parallel batch, S consecutive")
+            L.append("single-delegate messages. `maxT` is the most tools one message carried, `multiT` how many")
+            L.append("messages carried more than one - low values with high turn counts mean no batching.")
         elif group == "c":
             L.append("Per turn: tool errors by tool, commits, churned files, hard-fail flags. Git outcome per session.")
+            L.append(f"`out` is total tool-result characters for the turn; `big` counts single results >= {fmt_int(BIG_TOOL_OUTPUT_CHARS)} chars. `?` = not recorded.")
         else:
             L.append("Clean and praised sessions first. Per turn: quality, timing, tokens, prompt.")
         L.append("")
@@ -1095,6 +1218,7 @@ def write_slices(run_dir: Path, inv):
             ) if not caps.get(key, True)]
             if unavailable:
                 L.append(f"- transcript does not record: {', '.join(unavailable)}")
+            L.append(f"- models: {x.get('models') or 'none recorded'}; efforts: {x.get('efforts') or 'none recorded'}")
             if group == "a":
                 L.append(f"- {x['human_turns']} turns ({mm['openers']} opening), avg brief quality {x['avg_prompt_quality']}/5, corrections {mm['corrections']}, retries with no new info {mm['zero_info_retries']}")
                 L.append(f"- rule files in force: {', '.join(rule_files(x['cwd'])) or 'none found'}")
@@ -1105,16 +1229,21 @@ def write_slices(run_dir: Path, inv):
                 else:
                     L.append(f"- prompt span {x.get('span_hours')} h; active time and waiting time unavailable")
                 if caps.get("usage", True):
-                    L.append(f"- est ${xsp.get('est_cost_usd', 0):,.2f} (${xsp.get('est_cost_subagents_usd', 0):,.2f} of it in subagents) over {fmt_int(xsp.get('api_calls', 0))} calls, avg context per call {fmt_int(xsp.get('avg_context_per_call', 0))} tokens")
+                    partial = (f"; PARTIAL - no list price for {', '.join(xsp.get('unpriced_families', []))}"
+                               if xsp.get("cost_partial") else "")
+                    L.append(f"- est ${xsp.get('est_cost_usd', 0):,.2f} (${xsp.get('est_cost_subagents_usd', 0):,.2f} of it in subagents) over {fmt_int(xsp.get('api_calls', 0))} calls, avg context per call {fmt_int(xsp.get('avg_context_per_call', 0))} tokens{partial}")
                 else:
                     L.append("- cost, API-call count, and context size unavailable")
-                L.append(f"- delegations {mm['delegations']} (subagent files {mm['subagent_files']}), sequential read-only runs {mm['sequential_readonly_runs']}, compactions {mm['compactions']}")
+                compactions = mm["compactions"] if caps.get("compactions", True) else "unavailable"
+                L.append(f"- delegations {mm['delegations']} ({mm['parallel_delegations']} in parallel batches, {mm['sequential_delegation_runs']} sequential run-ons; subagent files {mm['subagent_files']}), sequential read-only runs {mm['sequential_readonly_runs']}, max tools per message {mm['max_tools_per_message']}, multi-tool messages {mm['multi_tool_messages']}, briefs in session {mm['briefs_in_session']}, compactions {compactions}")
                 L.append(f"- IDE plan mode used: {mm['plan_mode_used']} (this is NOT planning skills - check `skills attributed` in summary.md before claiming the user never plans)")
                 L.append(f"- permission mode per turn: {x['permission_modes'] or 'none recorded'}; mode-switch events during the session: {x.get('permission_mode_changes') or 'none'}")
                 L.append(f"- tools: {x['tools']}")
             elif group == "c":
                 tool_errors = mm["tool_errors"] if caps.get("tool_results", True) else "unavailable"
-                L.append(f"- tool errors {tool_errors}, failed agent turns {mm['turn_failures']}, denials {mm['denials']}, commits {mm['commits']}, churned files {mm['edit_churn_files'] or 'none'}, lines +{x['lines_added']}/-{x['lines_removed']}")
+                tool_out = (f"{short_chars(mm['tool_output_chars'])} chars in tool output, {mm['big_tool_outputs']} results >= {fmt_int(BIG_TOOL_OUTPUT_CHARS)} chars"
+                            if caps.get("tool_results", True) else "tool-output size unavailable")
+                L.append(f"- tool errors {tool_errors}, {tool_out}, failed agent turns {mm['turn_failures']}, denials {mm['denials']}, commits {mm['commits']}, churned files {mm['edit_churn_files'] or 'none'}, lines +{x['lines_added']}/-{x['lines_removed']}")
                 L.append(f"- branches seen: {x.get('branches') or 'none'}; commits were made on: {mm.get('commit_branches') or 'none'}")
                 L.append(f"- hard-fail: --no-verify {mm['no_verify']}, force-push {mm['force_push']}, committed on a shared branch {mm['on_main_with_commits']}")
                 L.append(f"- skills attributed: {x['skills_attributed'] or 'none'}")
@@ -1146,10 +1275,11 @@ def write_slices(run_dir: Path, inv):
                 elif group == "b":
                     agent = t["agent_seconds"] if caps.get("exact_timing", True) else "?"
                     wait = t["human_wait_seconds"] if caps.get("exact_timing", True) else "?"
-                    L.append(f"  - t{t['i']} {t['ts']} [{f}] agent {agent}s wait {wait}s msgs {t['assistant_msgs']} deleg {t['delegations']} seqRO {t['sequential_readonly_runs']} tools {t['tools']} : {short(t['text'], 80)}")
+                    L.append(f"  - t{t['i']} {t['ts']} [{f}] agent {agent}s wait {wait}s msgs {t['assistant_msgs']} deleg {t['delegations']}/{t['parallel_delegations']}par/{t['sequential_delegation_runs']}seq seqRO {t['sequential_readonly_runs']} maxT {t['max_tools_per_message']} multiT {t['multi_tool_messages']} tools {t['tools']} : {short(t['text'], 80)}")
                 elif group == "c":
                     errors = t["tool_errors"] if caps.get("tool_results", True) else "?"
-                    L.append(f"  - t{t['i']} {t['ts']} [{f}] errs {errors}{' ' + str(t['error_tools']) if t['error_tools'] else ''} turn-fail {t['turn_failures']} commits {t['commits']} churn {t['edit_churn_files'] or '-'} tools {t['tools']} : {short(t['text'], 120)}")
+                    big = f" big {t['big_tool_outputs']}" if t.get("big_tool_outputs") else ""
+                    L.append(f"  - t{t['i']} {t['ts']} [{f}] errs {errors}{' ' + str(t['error_tools']) if t['error_tools'] else ''} out {short_chars(t['tool_result_chars'])}{big} turn-fail {t['turn_failures']} commits {t['commits']} churn {t['edit_churn_files'] or '-'} tools {t['tools']} : {short(t['text'], 120)}")
                 else:
                     agent = t["agent_seconds"] if caps.get("exact_timing", True) else "?"
                     output = t["tokens"]["out"] if caps.get("usage", True) else "?"
@@ -1268,8 +1398,11 @@ def main(argv=None):
         return sum((s.get("tokens", {}).get(key, 0) or 0) for s in sessions)
     mech_keys = ["tool_errors", "turn_failures", "corrections", "zero_info_retries", "nudges", "frustration_turns", "praise_turns", "interrupts",
                  "re_read_turns", "sequential_readonly_runs", "compactions", "delegations", "subagent_files", "commits", "no_verify",
-                 "force_push", "openers", "low_quality_openers"]
+                 "force_push", "openers", "low_quality_openers", "multi_tool_messages", "parallel_delegations",
+                 "sequential_delegation_runs", "tool_output_chars", "big_tool_outputs", "briefs_in_session"]
     mech = {k: sum((s.get("mechanical", {}).get(k, 0) or 0) for s in sessions) for k in mech_keys}
+    mech["max_tools_per_message"] = max([(s.get("mechanical", {}).get("max_tools_per_message") or 0) for s in sessions] or [0])
+    mech["multi_brief_sessions"] = sum(1 for s in sessions if (s.get("mechanical", {}).get("briefs_in_session") or 0) >= 2)
     mech["denials"] = sum(sum(s.get("mechanical", {}).get("denials", {}).values()) for s in sessions)
     mech["plan_mode_sessions"] = sum(1 for s in sessions if s.get("mechanical", {}).get("plan_mode_used"))
     mech["on_main_with_commits"] = sum(1 for s in sessions if s.get("mechanical", {}).get("on_main_with_commits"))
@@ -1277,16 +1410,29 @@ def main(argv=None):
     skills_attr = Counter()
     skill_calls = Counter()
     slashes = Counter()
-    openers = Counter()
-    for s in sessions:
+    models = Counter()
+    efforts = Counter()
+    # an opener repeated inside one session is a retry loop; repeated across
+    # sessions it is a habit worth turning into a skill - count them separately
+    opener_hits = Counter()
+    opener_sessions = defaultdict(set)
+    for n, s in enumerate(sessions):
         tools.update(s.get("tools", {}))
         skills_attr.update(s.get("skills_attributed", {}))
         skill_calls.update(s.get("skill_tool_calls", {}))
         slashes.update(s.get("slash_commands", {}))
+        models.update(s.get("models", {}))
+        efforts.update(s.get("efforts", {}))
         for t in s.get("turns", []):
             words = re.findall(r"\w+", t["text"].lower())[:4]
             if len(words) >= 3 and not t["flags"]["nudge"]:
-                openers[" ".join(words)] += 1
+                key = " ".join(words)
+                opener_hits[key] += 1
+                opener_sessions[key].add(n)
+    repeated_openers = sorted(
+        ((k, len(opener_sessions[k]), v) for k, v in opener_hits.items() if len(opener_sessions[k]) >= 2),
+        key=lambda r: (-r[1], -r[2], r[0]),
+    )[:30]
     q_vals = [s["avg_prompt_quality"] for s in sessions if s.get("avg_prompt_quality") is not None]
     costs = [s["cost_usd"] for s in sessions if isinstance(s.get("cost_usd"), (int, float))]
     sp_keys = ("est_cost_usd", "est_cost_main_usd", "est_cost_subagents_usd", "api_calls",
@@ -1298,7 +1444,10 @@ def main(argv=None):
         "usage_unknown": sum(1 for s in sessions if not s.get("capabilities", {}).get("usage", True)),
         "timing_unknown": sum(1 for s in sessions if not s.get("capabilities", {}).get("exact_timing", True)),
         "tool_results_unknown": sum(1 for s in sessions if not s.get("capabilities", {}).get("tool_results", True)),
+        "compactions_unknown": sum(1 for s in sessions if not s.get("capabilities", {}).get("compactions", True)),
+        "pricing_partial": sum(1 for s in sessions if not s.get("capabilities", {}).get("pricing", True)),
     }
+    unpriced_models = sorted({m for s in sessions for m in s.get("spend", {}).get("unpriced_families", [])})
     summary = {
         "sessions": len(sessions), "by_tool": dict(Counter(s["tool"] for s in sessions)), "skipped_trivial": skipped,
         "human_turns": sum(s.get("human_turns", 0) for s in sessions), "assistant_msgs": sum(s.get("assistant_msgs", 0) for s in sessions),
@@ -1311,8 +1460,9 @@ def main(argv=None):
         "mechanical": mech, "tools": dict(tools.most_common(20)),
         "skills_attributed": dict(skills_attr.most_common(20)), "skill_tool_calls": dict(skill_calls.most_common(20)),
         "slash_commands": dict(slashes.most_common(20)),
+        "models": dict(models.most_common(20)), "efforts": dict(efforts.most_common(20)),
         "avg_prompt_quality": round(sum(q_vals) / len(q_vals), 2) if q_vals else None,
-        "coverage": coverage,
+        "coverage": coverage, "unpriced_models": unpriced_models,
     }
     seen_skill_tokens = set()
     for k in list(skills_attr) + list(skill_calls) + list(slashes):
@@ -1334,7 +1484,7 @@ def main(argv=None):
         "generated_at": now.isoformat(timespec="seconds"), "selection": selection,
         "previous_retro": state["retros"][-1] if state["retros"] else None,
         "notes_path": str(notes) if notes.is_file() else None,
-        "summary": summary, "repeated_openers": [(k, v) for k, v in openers.most_common(30) if v >= 2],
+        "summary": summary, "repeated_openers": repeated_openers,
         "skills_unseen": skills_unseen, "git": gitinfo, "sessions": sessions,
     }
     run_dir = app_home / "runs" / now.strftime("%Y%m%d-%H%M%S")
