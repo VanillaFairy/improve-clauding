@@ -53,9 +53,12 @@ DEFAULT_APP_HOME = HOME / ".improve-clauding"
 CLAUDE_PROJECTS = HOME / ".claude" / "projects"
 CURSOR_PROJECTS = HOME / ".cursor" / "projects"
 
-READ_ONLY_TOOLS = {"Read", "Grep", "Glob", "LS", "WebFetch", "WebSearch", "ToolSearch", "NotebookRead"}
-EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "StrReplace"}
-DELEGATE_TOOLS = {"Agent", "Task", "Workflow", "SendMessage"}
+READ_ONLY_TOOLS = {
+    "Read", "ReadFile", "Grep", "rg", "Glob", "LS", "WebFetch", "WebSearch",
+    "ToolSearch", "GetDynamicTools", "ReadLints", "NotebookRead",
+}
+EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit", "StrReplace", "ApplyPatch"}
+DELEGATE_TOOLS = {"Agent", "Task", "Subagent", "Workflow", "SendMessage"}
 SHELL_TOOLS = {"Bash", "PowerShell", "Shell"}
 
 CORRECTION_RE = re.compile(
@@ -80,9 +83,12 @@ INTERRUPT_RE = re.compile(r"\[Request interrupted by user", re.I)
 SLASH_RE = re.compile(r"<command-name>\s*(/[\w:.\-]+)\s*</command-name>")
 INJECTED_TAG_RE = re.compile(
     r"<(ide_opened_file|ide_selection|system-reminder|local-command-stdout|local-command-stderr|command-message|command-args|"
-    r"task-notification|attached_files|system_notification)>.*?</\1>\s*",
+    r"task-notification|attached_files|system_notification|open_and_recently_viewed_files|user_info|rules)>.*?</\1>\s*",
     re.S | re.I,
 )
+CURSOR_QUERY_RE = re.compile(r"<user_query>\s*(.*?)\s*</user_query>", re.S | re.I)
+CURSOR_TIMESTAMP_RE = re.compile(r"<timestamp>\s*(.*?)\s*</timestamp>", re.S | re.I)
+CURSOR_SLASH_RE = re.compile(r"^\s*(/[\w:.\-]+)\b")
 GIT_COMMIT_RE = re.compile(r"\bgit\s+(?:-C\s+\S+\s+)?commit\b")
 NO_VERIFY_RE = re.compile(r"--no-verify\b")
 FORCE_PUSH_RE = re.compile(r"\bgit\s+push\b[^\n]*\s(--force|-f)\b")
@@ -146,6 +152,42 @@ def text_of(content):
                 parts.append(b)
         return "\n".join(parts), blocks
     return "", []
+
+
+def cursor_timestamp(text):
+    """Parse Cursor's user-facing timestamp tag into UTC."""
+    match = CURSOR_TIMESTAMP_RE.search(text or "")
+    if not match:
+        return None
+    raw = match.group(1).strip()
+    zoned = re.fullmatch(r"(.+?)\s+\(UTC([+-])(\d{1,2})(?::(\d{2}))?\)", raw)
+    if not zoned:
+        return parse_ts(raw)
+    local = None
+    for form in ("%A, %b %d, %Y, %I:%M %p", "%A, %B %d, %Y, %I:%M %p",
+                 "%b %d, %Y, %I:%M %p", "%B %d, %Y, %I:%M %p"):
+        try:
+            local = dt.datetime.strptime(zoned.group(1), form)
+            break
+        except ValueError:
+            pass
+    if local is None:
+        return None
+    minutes = int(zoned.group(3)) * 60 + int(zoned.group(4) or 0)
+    if zoned.group(2) == "-":
+        minutes = -minutes
+    return local.replace(tzinfo=dt.timezone(dt.timedelta(minutes=minutes))).astimezone(dt.timezone.utc)
+
+
+def normalize_prompt(text, tool):
+    """Remove IDE context wrappers while preserving the user's words."""
+    text = text or ""
+    if tool == "cursor":
+        queries = [q.strip() for q in CURSOR_QUERY_RE.findall(text) if q.strip()]
+        if queries:
+            return "\n\n".join(queries)
+        text = CURSOR_TIMESTAMP_RE.sub("", text)
+    return INJECTED_TAG_RE.sub("", text).strip()
 
 
 def prompt_quality(text):
@@ -240,11 +282,29 @@ def discover_cursor():
     if not CURSOR_PROJECTS.is_dir():
         return out
     for proj in CURSOR_PROJECTS.iterdir():
+        if not proj.is_dir():
+            continue
         tdir = proj / "agent-transcripts"
         if not tdir.is_dir():
             continue
-        for f in tdir.glob("*.jsonl"):
-            out.append({"tool": "cursor", "path": str(f), "session_id": f.stem, "project_slug": proj.name, "subagent_files": 0})
+        # Current Cursor builds put each main transcript in
+        # agent-transcripts/<session-id>/<session-id>.jsonl. Keep the direct
+        # pattern for older builds.
+        files = {
+            f.stem: f
+            for f in list(tdir.glob("*.jsonl")) + list(tdir.glob("*/*.jsonl"))
+        }
+        for f in files.values():
+            sub_dir = f.parent / "subagents"
+            subs = [str(p) for p in sub_dir.glob("*.jsonl")] if sub_dir.is_dir() else []
+            out.append({
+                "tool": "cursor",
+                "path": str(f),
+                "session_id": f.stem,
+                "project_slug": proj.name,
+                "subagent_files": len(subs),
+                "subagent_paths": subs,
+            })
     return out
 
 
@@ -294,7 +354,7 @@ def parse_session(meta):
             "permission_mode_changes": Counter(), "models": Counter(), "usage_by_family": defaultdict(Counter),
             "efforts": Counter(), "skills_attributed": Counter(), "compactions": 0, "hook_errors": 0,
             "denials": Counter(), "refusals": 0, "system_subtypes": Counter(), "turn_durations_ms": [],
-            "bad_lines": 0, "lines": 0}
+            "turn_errors": Counter(), "bad_lines": 0, "lines": 0}
     with open(path, encoding="utf-8", errors="replace") as fh:
         for line in fh:
             misc["lines"] += 1
@@ -341,6 +401,15 @@ def parse_session(meta):
             if t == "cost-state":
                 misc["cost_state"] = rec
                 continue
+            if t == "turn_ended":
+                if rec.get("status") == "error":
+                    error = str(rec.get("error") or "unknown Cursor turn error")
+                    misc["turn_errors"][error] += 1
+                    if re.search(r"user aborted|cancellation token requested", error, re.I):
+                        events.append({"kind": "interrupt", "ts": ts})
+                    else:
+                        events.append({"kind": "turn_error", "ts": ts, "error": error})
+                continue
             if t == "system":
                 st = rec.get("subtype")
                 misc["system_subtypes"][st] += 1
@@ -362,6 +431,8 @@ def parse_session(meta):
             text, blocks = text_of(content)
 
             if role == "user" or t == "user":
+                if meta.get("tool") == "cursor" and ts is None:
+                    ts = cursor_timestamp(text)
                 tool_results = [b for b in blocks if b.get("type") == "tool_result"]
                 if tool_results:
                     for b in tool_results:
@@ -370,14 +441,16 @@ def parse_session(meta):
                                        "is_error": bool(b.get("is_error")), "chars": len(rtxt),
                                        "sidechain": bool(rec.get("isSidechain"))})
                     continue
+                text = normalize_prompt(text, meta.get("tool"))
                 if INTERRUPT_RE.search(text):
                     events.append({"kind": "interrupt", "ts": ts})
                     continue
                 m = SLASH_RE.search(text)
+                if not m and meta.get("tool") == "cursor":
+                    m = CURSOR_SLASH_RE.search(text)
                 if m:
                     events.append({"kind": "slash", "ts": ts, "command": m.group(1)})
                     continue
-                text = INJECTED_TAG_RE.sub("", text)
                 if is_human_prompt(rec, text, blocks):
                     # count the mode once per human turn, not once per tool result
                     if rec.get("permissionMode"):
@@ -408,8 +481,17 @@ def parse_session(meta):
                 for b in blocks:
                     if b.get("type") == "tool_use":
                         inp = b.get("input") if isinstance(b.get("input"), dict) else {}
-                        target = inp.get("file_path") or inp.get("path") or inp.get("pattern") or inp.get("command") or inp.get("url") or inp.get("skill") or inp.get("description") or ""
-                        tool_uses.append({"id": b.get("id"), "name": b.get("name"), "target": short(str(target), 200),
+                        name = b.get("name")
+                        if name == "CallDynamicTool" and inp.get("toolName"):
+                            name = inp["toolName"]
+                        target = (inp.get("file_path") or inp.get("path") or inp.get("pattern") or
+                                  inp.get("command") or inp.get("url") or inp.get("skill") or
+                                  inp.get("description") or inp.get("toolName") or "")
+                        if not misc["cwd"]:
+                            candidate = inp.get("working_directory") or inp.get("target_directory")
+                            if candidate and os.path.isdir(candidate):
+                                misc["cwd"] = candidate
+                        tool_uses.append({"id": b.get("id"), "name": name, "target": short(str(target), 200),
                                           "input_hash": sha(json.dumps(inp, sort_keys=True, default=str))})
                 events.append({"kind": "assistant", "ts": ts, "model": msg.get("model"),
                                "in": usage.get("input_tokens", 0) or 0,
@@ -435,8 +517,14 @@ def analyze(meta, events, misc, now):
     result_by_id = {r["tool_use_id"]: r for r in results if r.get("tool_use_id")}
     tss = sorted(e["ts"] for e in events if e.get("ts"))
     start, end = (tss[0], tss[-1]) if tss else (None, None)
+    timing_available = bool(prompts and any(e.get("ts") for e in assistants))
+    usage_available = meta["tool"] != "cursor" or bool(misc["usage_by_family"])
+    tool_results_available = meta["tool"] != "cursor" or bool(results)
     # active duration: sum of inter-event gaps, ignoring idle gaps over 60 min
-    active_sec = sum(min((b - a_).total_seconds(), 3600) for a_, b in zip(tss, tss[1:]) if (b - a_).total_seconds() < 3600)
+    active_sec = (sum(min((b - a_).total_seconds(), 3600)
+                      for a_, b in zip(tss, tss[1:])
+                      if (b - a_).total_seconds() < 3600)
+                  if timing_available else None)
 
     # ---- turns: each human prompt owns everything until the next human prompt
     turns = []
@@ -462,6 +550,8 @@ def analyze(meta, events, misc, now):
         skills = Counter()
         plan_mode = 0
         interrupts = 0
+        turn_failures = 0
+        turn_failure_reasons = Counter()
         slashes = []
         last_assistant_ts = None
         for e in seg:
@@ -480,7 +570,7 @@ def analyze(meta, events, misc, now):
                         delegations += 1
                     if tu["name"] == "Skill":
                         skills[tu["target"]] += 1
-                    if tu["name"] in ("EnterPlanMode", "ExitPlanMode"):
+                    if tu["name"] in ("EnterPlanMode", "ExitPlanMode", "SwitchMode"):
                         plan_mode += 1
                     if tu["name"] in SHELL_TOOLS:
                         cmd = tu["target"]
@@ -503,6 +593,9 @@ def analyze(meta, events, misc, now):
                 prev_single_ro = is_single_ro
             elif e["kind"] == "interrupt":
                 interrupts += 1
+            elif e["kind"] == "turn_error":
+                turn_failures += 1
+                turn_failure_reasons[e["error"]] += 1
             elif e["kind"] == "slash":
                 slashes.append(e["command"])
         # timing
@@ -536,6 +629,7 @@ def analyze(meta, events, misc, now):
             "re_reads": re_reads, "sequential_readonly_runs": single_ro_seq, "delegations": delegations,
             "edit_churn_files": churn_files[:5], "commits": commits, "commit_branches": sorted(commit_branches),
             "no_verify": no_verify, "force_push": force_push,
+            "turn_failures": turn_failures, "turn_failure_reasons": dict(turn_failure_reasons),
             "skills": dict(skills), "slash": slashes, "plan_mode_tools": plan_mode,
             "tokens": {"in": tok_in, "out": tok_out, "cache_read": cache_r, "cache_create": cache_c},
             "thinking_chars": thinking,
@@ -546,7 +640,14 @@ def analyze(meta, events, misc, now):
     # already there. Only opening prompts are scored as task briefs: the first turn
     # of the session, or one the user came back to after a break.
     for n, t in enumerate(turns):
-        t["is_opener"] = n == 0 or (turns[n - 1]["human_wait_seconds"] or 0) >= OPENER_GAP_SEC
+        prompt_gap = None
+        if n:
+            previous_ts, current_ts = parse_ts(turns[n - 1]["ts"]), parse_ts(t["ts"])
+            if previous_ts and current_ts:
+                prompt_gap = (current_ts - previous_ts).total_seconds()
+        t["is_opener"] = (n == 0 or
+                          (turns[n - 1]["human_wait_seconds"] or 0) >= OPENER_GAP_SEC or
+                          (not timing_available and (prompt_gap or 0) >= OPENER_GAP_SEC))
     openers = [t for t in turns if t["is_opener"]]
 
     # ---- session-level aggregates
@@ -562,9 +663,12 @@ def analyze(meta, events, misc, now):
         for k, v in t["flags"].items():
             if v:
                 flags[k] += 1
-    agent_secs = sum(t["agent_seconds"] or 0 for t in turns)
-    human_secs = sum(t["human_wait_seconds"] or 0 for t in turns if (t["human_wait_seconds"] or 0) < 3600)
-    long_gaps = sum(1 for t in turns if (t["human_wait_seconds"] or 0) >= 1800)
+    agent_secs = sum(t["agent_seconds"] or 0 for t in turns) if timing_available else None
+    human_secs = (sum(t["human_wait_seconds"] or 0 for t in turns
+                      if (t["human_wait_seconds"] or 0) < 3600)
+                  if timing_available else None)
+    long_gaps = (sum(1 for t in turns if (t["human_wait_seconds"] or 0) >= 1800)
+                 if timing_available else None)
     slash_cmds = Counter(c for t in turns for c in t["slash"])
     skill_tools = Counter()
     for t in turns:
@@ -589,6 +693,7 @@ def analyze(meta, events, misc, now):
     ctx_read = sum(u.get("cache_read", 0) + u.get("in", 0) for u in combined.values())
     all_calls = main_calls + sub_calls
     spend = {
+        "available": usage_available,
         "est_cost_usd": round(cost_main + cost_sub, 2),
         "est_cost_main_usd": cost_main,
         "est_cost_subagents_usd": cost_sub,
@@ -608,6 +713,8 @@ def analyze(meta, events, misc, now):
         "frustration_turns": flags["frustration"],
         "praise_turns": flags["praise"],
         "interrupts": sum(1 for e in events if e["kind"] == "interrupt"),
+        "turn_failures": sum(t["turn_failures"] for t in turns),
+        "turn_failure_reasons": dict(misc["turn_errors"]),
         "re_read_turns": sum(1 for t in turns if t["re_reads"]),
         "sequential_readonly_runs": sum(t["sequential_readonly_runs"] for t in turns),
         "edit_churn_files": sorted({f for t in turns for f in t["edit_churn_files"]})[:8],
@@ -629,11 +736,13 @@ def analyze(meta, events, misc, now):
     }
     # heuristic attention score: how much this session deserves LLM reading
     attention = (mech["corrections"] * 2 + mech["zero_info_retries"] * 3 + mech["frustration_turns"] * 4 +
-                 mech["interrupts"] * 2 + min(mech["tool_errors"], 10) + mech["nudges"] +
+                 mech["interrupts"] * 2 + mech["turn_failures"] * 2 +
+                 min(mech["tool_errors"], 10) + mech["nudges"] +
                  len(mech["edit_churn_files"]) * 2 + mech["no_verify"] * 5 + mech["force_push"] * 5)
     # good-pattern candidates: few turns, no corrections, edits/commits happened, praise or clean end
     clean = (len(turns) >= 2 and mech["corrections"] == 0 and mech["zero_info_retries"] == 0 and
-             mech["frustration_turns"] == 0 and (sum(tool_counter[t] for t in EDIT_TOOLS) > 0 or mech["commits"] > 0))
+             mech["frustration_turns"] == 0 and mech["turn_failures"] == 0 and
+             (sum(tool_counter[t] for t in EDIT_TOOLS) > 0 or mech["commits"] > 0))
 
     return {
         "tool": meta["tool"], "session_id": meta["session_id"], "project_slug": meta["project_slug"], "path": meta["path"],
@@ -643,7 +752,7 @@ def analyze(meta, events, misc, now):
         "entrypoint": misc["entrypoint"], "app_version": misc["version"],
         "start": iso(start), "end": iso(end), "age_hours": round(age_h, 1) if age_h is not None else None,
         "outcome_pending": bool(age_h is not None and age_h < 24),
-        "duration_min": round(active_sec / 60, 1) if tss else None,
+        "duration_min": round(active_sec / 60, 1) if active_sec is not None else None,
         "span_hours": round((end - start).total_seconds() / 3600, 1) if (start and end) else None,
         "human_turns": len(turns), "assistant_msgs": len(assistants),
         "tokens": tok, "cache_ratio": cache_ratio, "thinking_chars": sum(t["thinking_chars"] for t in turns),
@@ -659,7 +768,14 @@ def analyze(meta, events, misc, now):
         "slash_commands": dict(slash_cmds),
         "avg_prompt_quality": avg_q,
         "mechanical": mech, "attention_score": attention, "clean_candidate": clean,
-        "parse": {"lines": misc["lines"], "bad_lines": misc["bad_lines"], "format": "claude" if meta["tool"] == "claude" else "unverified"},
+        "capabilities": {
+            "usage": usage_available,
+            "exact_timing": timing_available,
+            "tool_results": tool_results_available,
+            "model": bool(misc["models"]),
+            "cwd": bool(misc["cwd"]),
+        },
+        "parse": {"lines": misc["lines"], "bad_lines": misc["bad_lines"], "format": meta["tool"]},
         "turns": turns,
     }
 
@@ -812,21 +928,36 @@ def write_summary(run_dir: Path, inv):
     L.append(f"Previous retro: {inv['previous_retro'] or 'none'}  |  notes file: {inv['notes_path'] or 'none'}")
     L.append("")
     L.append("## Totals")
-    L.append(f"- human turns {s['human_turns']}, assistant msgs {s['assistant_msgs']}, active session time {s['duration_min']} min (idle gaps >60 min excluded), agent-active {s['agent_active_min']} min, human-wait {s['human_wait_min']} min")
+    coverage = s.get("coverage", {})
+    timing_note = (f"; exact timing unavailable for {coverage.get('timing_unknown', 0)} session(s)"
+                   if coverage.get("timing_unknown") else "")
+    if coverage.get("timing_unknown") == s["sessions"] and s["sessions"]:
+        L.append(f"- human turns {s['human_turns']}, assistant msgs {s['assistant_msgs']}; exact timing unavailable")
+    else:
+        L.append(f"- human turns {s['human_turns']}, assistant msgs {s['assistant_msgs']}, measured active session time {s['duration_min']} min, agent-active {s['agent_active_min']} min, human-wait {s['human_wait_min']} min{timing_note}")
     sp = s["spend"]
-    L.append(f"- SPEND (list-price estimate): ${sp['est_cost_usd']:,.2f} total = ${sp['est_cost_main_usd']:,.2f} main + ${sp['est_cost_subagents_usd']:,.2f} subagents")
-    L.append(f"- {fmt_int(sp['api_calls'])} API calls ({fmt_int(sp['api_calls_main'])} main + {fmt_int(sp['api_calls_subagents'])} subagent), each re-reading {fmt_int(sp['avg_context_per_call'])} tokens of context on average")
-    L.append(f"- context re-read across all calls: {fmt_int(sp['context_read_tokens'])} tokens. This, not output, is where the money goes.")
-    L.append(f"- output {fmt_int(s['tokens']['out'])}, cache_create {fmt_int(s['tokens']['cache_create'])}, uncached in {fmt_int(s['tokens']['in'])} (main sessions only)")
-    L.append("  Do NOT read a high cache ratio as efficiency: it means each call was cheap per token,")
-    L.append("  not that there were few calls or small contexts. Cost = calls x context size.")
-    if isinstance(s.get("cost_usd"), (int, float)):
-        L.append(f"  (Claude Code's own cost-state field reports ${s['cost_usd']:.2f}; it is usually absent or zero - ignore it.)")
+    usage_note = (f"; excludes {coverage.get('usage_unknown', 0)} session(s) without usage records"
+                  if coverage.get("usage_unknown") else "")
+    if coverage.get("usage_unknown") == s["sessions"] and s["sessions"]:
+        L.append("- SPEND: unavailable because these transcripts contain no token-usage records")
+        L.append("- API-call count, context size, and token totals are also unavailable")
+    else:
+        L.append(f"- SPEND (list-price estimate from available usage): ${sp['est_cost_usd']:,.2f} total = ${sp['est_cost_main_usd']:,.2f} main + ${sp['est_cost_subagents_usd']:,.2f} subagents{usage_note}")
+        L.append(f"- measured API calls {fmt_int(sp['api_calls'])} ({fmt_int(sp['api_calls_main'])} main + {fmt_int(sp['api_calls_subagents'])} subagent), each re-reading {fmt_int(sp['avg_context_per_call'])} tokens of context on average")
+        L.append(f"- measured context re-read across all calls: {fmt_int(sp['context_read_tokens'])} tokens. This, not output, is where the money goes.")
+        L.append(f"- measured output {fmt_int(s['tokens']['out'])}, cache_create {fmt_int(s['tokens']['cache_create'])}, uncached in {fmt_int(s['tokens']['in'])} (main sessions only)")
+    if coverage.get("usage_unknown", 0) < s["sessions"]:
+        L.append("  Do NOT read a high cache ratio as efficiency: it means each call was cheap per token,")
+        L.append("  not that there were few calls or small contexts. Cost = calls x context size.")
+        if isinstance(s.get("cost_usd"), (int, float)):
+            L.append(f"  (Claude Code's own cost-state field reports ${s['cost_usd']:.2f}; it is usually absent or zero - ignore it.)")
     m = s["mechanical"]
-    L.append(f"- corrections {m['corrections']}, zero-info retries {m['zero_info_retries']}, nudges {m['nudges']}, frustration turns {m['frustration_turns']}, praise turns {m['praise_turns']}, interrupts {m['interrupts']}")
-    L.append(f"- tool errors {m['tool_errors']}, re-read turns {m['re_read_turns']}, sequential read-only runs {m['sequential_readonly_runs']}, compactions {m['compactions']}, denials {m['denials']}")
+    L.append(f"- corrections {m['corrections']}, zero-info retries {m['zero_info_retries']}, nudges {m['nudges']}, frustration turns {m['frustration_turns']}, praise turns {m['praise_turns']}, interrupts {m['interrupts']}, failed agent turns {m['turn_failures']}")
+    result_note = (f"; tool-result status unavailable for {coverage.get('tool_results_unknown', 0)} session(s)"
+                   if coverage.get("tool_results_unknown") else "")
+    L.append(f"- measured tool errors {m['tool_errors']}, re-read turns {m['re_read_turns']}, sequential read-only runs {m['sequential_readonly_runs']}, compactions {m['compactions']}, denials {m['denials']}{result_note}")
     L.append(f"- delegations {m['delegations']} (subagent files {m['subagent_files']}), commits {m['commits']}, --no-verify {m['no_verify']}, force-push {m['force_push']}, sessions committing on a shared branch {m['on_main_with_commits']}")
-    L.append(f"- sessions using Claude Code plan mode {m['plan_mode_sessions']} (the IDE mode only; planning *skills* are in the list below)")
+    L.append(f"- sessions using an IDE plan mode {m['plan_mode_sessions']} (planning *skills* are in the list below)")
     L.append(f"- opening prompts {m['openers']} of {s['human_turns']} turns; average brief quality {s['avg_prompt_quality']} / 5; thin briefs {m['low_quality_openers']}")
     L.append("  (quality is scored only on opening prompts - a terse follow-up inside a live thread is not a bad prompt)")
     L.append("")
@@ -852,14 +983,22 @@ def write_summary(run_dir: Path, inv):
     for n, x in enumerate(inv["sessions"]):
         mm = x["mechanical"]
         xsp = x.get("spend", {})
+        caps = x.get("capabilities", {})
         when = (x["start"] or "")[:16].replace("T", " ")
         title = short(x["title"] or x["first_prompt"], 70)
-        L.append(f"| {n} | {x['tool']} | {when} | {x['duration_min'] or '-'} | {x['human_turns']} | {xsp.get('est_cost_usd', 0):,.0f} | {fmt_int(xsp.get('api_calls', 0))} | {mm['corrections']} | {mm['zero_info_retries']} | {mm['nudges']} | {mm['frustration_turns']} | {mm['tool_errors']} | {mm['delegations']} | {x['attention_score']} | {'y' if x['clean_candidate'] else ''} | {title} |")
+        duration = x["duration_min"] if caps.get("exact_timing", True) else "-"
+        cost = f"{xsp.get('est_cost_usd', 0):,.0f}" if caps.get("usage", True) else "-"
+        calls = fmt_int(xsp.get("api_calls", 0)) if caps.get("usage", True) else "-"
+        errors = mm["tool_errors"] if caps.get("tool_results", True) else "-"
+        L.append(f"| {n} | {x['tool']} | {when} | {duration} | {x['human_turns']} | {cost} | {calls} | {mm['corrections']} | {mm['zero_info_retries']} | {mm['nudges']} | {mm['frustration_turns']} | {errors} | {mm['delegations']} | {x['attention_score']} | {'y' if x['clean_candidate'] else ''} | {title} |")
     L.append("")
     L.append("## Clean sessions (endorsement candidates)")
     for n, x in enumerate(inv["sessions"]):
         if x["clean_candidate"]:
-            L.append(f"- [{n}] {x['tool']} {x['human_turns']} turns, {x['duration_min']} min, out {fmt_int(x['tokens']['out'])}: {short(x['title'] or x['first_prompt'], 90)}")
+            caps = x.get("capabilities", {})
+            timing = f"{x['duration_min']} min" if caps.get("exact_timing", True) else "exact time unavailable"
+            output = f"out {fmt_int(x['tokens']['out'])}" if caps.get("usage", True) else "token use unavailable"
+            L.append(f"- [{n}] {x['tool']} {x['human_turns']} turns, {timing}, {output}: {short(x['title'] or x['first_prompt'], 90)}")
     L.append("")
     if inv["git"]:
         L.append("## Git outcome signals")
@@ -947,20 +1086,35 @@ def write_slices(run_dir: Path, inv):
                 continue
             turns, total = _pick_turns(x, group)
             mm = x["mechanical"]
+            caps = x.get("capabilities", {})
             L.append(f"## [{n}] {x['tool']} {x['session_id']} - {short(x['title'] or x['first_prompt'], 70)}")
+            unavailable = [label for key, label in (
+                ("usage", "cost and token use"),
+                ("exact_timing", "exact timing"),
+                ("tool_results", "tool-result and tool-error status"),
+            ) if not caps.get(key, True)]
+            if unavailable:
+                L.append(f"- transcript does not record: {', '.join(unavailable)}")
             if group == "a":
                 L.append(f"- {x['human_turns']} turns ({mm['openers']} opening), avg brief quality {x['avg_prompt_quality']}/5, corrections {mm['corrections']}, retries with no new info {mm['zero_info_retries']}")
                 L.append(f"- rule files in force: {', '.join(rule_files(x['cwd'])) or 'none found'}")
             elif group == "b":
                 xsp = x.get("spend", {})
-                L.append(f"- span {x.get('span_hours')} h, active {x['duration_min']} min, agent-active {round((x['agent_active_sec'] or 0)/60)} min, human-wait {round((x['human_wait_sec'] or 0)/60)} min, long gaps {x['long_gaps']}")
-                L.append(f"- est ${xsp.get('est_cost_usd', 0):,.2f} (${xsp.get('est_cost_subagents_usd', 0):,.2f} of it in subagents) over {fmt_int(xsp.get('api_calls', 0))} calls, avg context per call {fmt_int(xsp.get('avg_context_per_call', 0))} tokens")
+                if caps.get("exact_timing", True):
+                    L.append(f"- span {x.get('span_hours')} h, active {x['duration_min']} min, agent-active {round((x['agent_active_sec'] or 0)/60)} min, human-wait {round((x['human_wait_sec'] or 0)/60)} min, long gaps {x['long_gaps']}")
+                else:
+                    L.append(f"- prompt span {x.get('span_hours')} h; active time and waiting time unavailable")
+                if caps.get("usage", True):
+                    L.append(f"- est ${xsp.get('est_cost_usd', 0):,.2f} (${xsp.get('est_cost_subagents_usd', 0):,.2f} of it in subagents) over {fmt_int(xsp.get('api_calls', 0))} calls, avg context per call {fmt_int(xsp.get('avg_context_per_call', 0))} tokens")
+                else:
+                    L.append("- cost, API-call count, and context size unavailable")
                 L.append(f"- delegations {mm['delegations']} (subagent files {mm['subagent_files']}), sequential read-only runs {mm['sequential_readonly_runs']}, compactions {mm['compactions']}")
-                L.append(f"- Claude Code plan mode used: {mm['plan_mode_used']} (this is the IDE mode, NOT planning skills - check `skills attributed` in summary.md before claiming the user never plans)")
+                L.append(f"- IDE plan mode used: {mm['plan_mode_used']} (this is NOT planning skills - check `skills attributed` in summary.md before claiming the user never plans)")
                 L.append(f"- permission mode per turn: {x['permission_modes'] or 'none recorded'}; mode-switch events during the session: {x.get('permission_mode_changes') or 'none'}")
                 L.append(f"- tools: {x['tools']}")
             elif group == "c":
-                L.append(f"- tool errors {mm['tool_errors']}, denials {mm['denials']}, commits {mm['commits']}, churned files {mm['edit_churn_files'] or 'none'}, lines +{x['lines_added']}/-{x['lines_removed']}")
+                tool_errors = mm["tool_errors"] if caps.get("tool_results", True) else "unavailable"
+                L.append(f"- tool errors {tool_errors}, failed agent turns {mm['turn_failures']}, denials {mm['denials']}, commits {mm['commits']}, churned files {mm['edit_churn_files'] or 'none'}, lines +{x['lines_added']}/-{x['lines_removed']}")
                 L.append(f"- branches seen: {x.get('branches') or 'none'}; commits were made on: {mm.get('commit_branches') or 'none'}")
                 L.append(f"- hard-fail: --no-verify {mm['no_verify']}, force-push {mm['force_push']}, committed on a shared branch {mm['on_main_with_commits']}")
                 L.append(f"- skills attributed: {x['skills_attributed'] or 'none'}")
@@ -974,7 +1128,10 @@ def write_slices(run_dir: Path, inv):
                     L.append("- OUTCOME PENDING (<24h old): do not claim outcomes for this session")
             else:
                 xsp = x.get("spend", {})
-                L.append(f"- {x['human_turns']} turns, active {x['duration_min']} min, est ${xsp.get('est_cost_usd', 0):,.2f} over {fmt_int(xsp.get('api_calls', 0))} calls, praise {mm['praise_turns']}, corrections {mm['corrections']}, clean {x['clean_candidate']}")
+                timing = f"active {x['duration_min']} min" if caps.get("exact_timing", True) else "exact time unavailable"
+                cost = (f"est ${xsp.get('est_cost_usd', 0):,.2f} over {fmt_int(xsp.get('api_calls', 0))} calls"
+                        if caps.get("usage", True) else "cost unavailable")
+                L.append(f"- {x['human_turns']} turns, {timing}, {cost}, praise {mm['praise_turns']}, corrections {mm['corrections']}, clean {x['clean_candidate']}")
                 L.append(f"- delegations {mm['delegations']}, commits {mm['commits']}, lines +{x['lines_added']}/-{x['lines_removed']}, skills {x['skills_attributed'] or 'none'}")
             if total > len(turns):
                 L.append(f"- showing {len(turns)} of {total} relevant turns (excerpt.py for the rest)")
@@ -987,11 +1144,16 @@ def write_slices(run_dir: Path, inv):
                                                      "criteria": "has_criteria", "intent": "has_intent"}[k])) or "-"
                     L.append(f"  - t{t['i']} {t['ts']} {'OPEN' if t.get('is_opener') else 'cont'} [{f}] q{q['score']} missing:{missing} : {short(t['text'], 240)}")
                 elif group == "b":
-                    L.append(f"  - t{t['i']} {t['ts']} [{f}] agent {t['agent_seconds']}s wait {t['human_wait_seconds']}s msgs {t['assistant_msgs']} deleg {t['delegations']} seqRO {t['sequential_readonly_runs']} tools {t['tools']} : {short(t['text'], 80)}")
+                    agent = t["agent_seconds"] if caps.get("exact_timing", True) else "?"
+                    wait = t["human_wait_seconds"] if caps.get("exact_timing", True) else "?"
+                    L.append(f"  - t{t['i']} {t['ts']} [{f}] agent {agent}s wait {wait}s msgs {t['assistant_msgs']} deleg {t['delegations']} seqRO {t['sequential_readonly_runs']} tools {t['tools']} : {short(t['text'], 80)}")
                 elif group == "c":
-                    L.append(f"  - t{t['i']} {t['ts']} [{f}] errs {t['tool_errors']}{' ' + str(t['error_tools']) if t['error_tools'] else ''} commits {t['commits']} churn {t['edit_churn_files'] or '-'} tools {t['tools']} : {short(t['text'], 120)}")
+                    errors = t["tool_errors"] if caps.get("tool_results", True) else "?"
+                    L.append(f"  - t{t['i']} {t['ts']} [{f}] errs {errors}{' ' + str(t['error_tools']) if t['error_tools'] else ''} turn-fail {t['turn_failures']} commits {t['commits']} churn {t['edit_churn_files'] or '-'} tools {t['tools']} : {short(t['text'], 120)}")
                 else:
-                    L.append(f"  - t{t['i']} {t['ts']} [{f}] q{t['quality']['score']} agent {t['agent_seconds']}s msgs {t['assistant_msgs']} out {t['tokens']['out']} deleg {t['delegations']} : {short(t['text'], 200)}")
+                    agent = t["agent_seconds"] if caps.get("exact_timing", True) else "?"
+                    output = t["tokens"]["out"] if caps.get("usage", True) else "?"
+                    L.append(f"  - t{t['i']} {t['ts']} [{f}] q{t['quality']['score']} agent {agent}s msgs {t['assistant_msgs']} out {output} deleg {t['delegations']} : {short(t['text'], 200)}")
             L.append("")
         name = SLICES[group][0]
         (run_dir / f"slice-{group}-{name}.md").write_text("\n".join(L), encoding="utf-8")
@@ -1104,7 +1266,7 @@ def main(argv=None):
     # ---- cross-session aggregates
     def agg(key):
         return sum((s.get("tokens", {}).get(key, 0) or 0) for s in sessions)
-    mech_keys = ["tool_errors", "corrections", "zero_info_retries", "nudges", "frustration_turns", "praise_turns", "interrupts",
+    mech_keys = ["tool_errors", "turn_failures", "corrections", "zero_info_retries", "nudges", "frustration_turns", "praise_turns", "interrupts",
                  "re_read_turns", "sequential_readonly_runs", "compactions", "delegations", "subagent_files", "commits", "no_verify",
                  "force_push", "openers", "low_quality_openers"]
     mech = {k: sum((s.get("mechanical", {}).get(k, 0) or 0) for s in sessions) for k in mech_keys}
@@ -1132,6 +1294,11 @@ def main(argv=None):
     spend_tot = {k: round(sum((s.get("spend", {}).get(k, 0) or 0) for s in sessions), 2) for k in sp_keys}
     spend_tot["avg_context_per_call"] = (round(spend_tot["context_read_tokens"] / spend_tot["api_calls"])
                                          if spend_tot["api_calls"] else 0)
+    coverage = {
+        "usage_unknown": sum(1 for s in sessions if not s.get("capabilities", {}).get("usage", True)),
+        "timing_unknown": sum(1 for s in sessions if not s.get("capabilities", {}).get("exact_timing", True)),
+        "tool_results_unknown": sum(1 for s in sessions if not s.get("capabilities", {}).get("tool_results", True)),
+    }
     summary = {
         "sessions": len(sessions), "by_tool": dict(Counter(s["tool"] for s in sessions)), "skipped_trivial": skipped,
         "human_turns": sum(s.get("human_turns", 0) for s in sessions), "assistant_msgs": sum(s.get("assistant_msgs", 0) for s in sessions),
@@ -1145,6 +1312,7 @@ def main(argv=None):
         "skills_attributed": dict(skills_attr.most_common(20)), "skill_tool_calls": dict(skill_calls.most_common(20)),
         "slash_commands": dict(slashes.most_common(20)),
         "avg_prompt_quality": round(sum(q_vals) / len(q_vals), 2) if q_vals else None,
+        "coverage": coverage,
     }
     seen_skill_tokens = set()
     for k in list(skills_attr) + list(skill_calls) + list(slashes):

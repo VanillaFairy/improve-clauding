@@ -65,6 +65,7 @@ def render(sn, sess, turn_idx, context, budget):
     meta = {"path": str(path), "tool": sess["tool"], "session_id": sess["session_id"],
             "project_slug": sess["project_slug"], "subagent_files": 0}
     events, _ = inv_mod.parse_session(meta)
+    capabilities = sess.get("capabilities", {})
     prompt_idx = [i for i, e in enumerate(events) if e["kind"] == "prompt"]
     lo, hi = turn_idx - context, turn_idx + context
     out, used = [], 0
@@ -95,6 +96,9 @@ def render(sn, sess, turn_idx, context, budget):
             if e["kind"] == "interrupt":
                 emit("  [interrupted by user]")
                 continue
+            if e["kind"] == "turn_error":
+                emit(f"  [agent turn failed: {inv_mod.short(e['error'], ERROR_BODY_CHARS)}]")
+                continue
             if e["kind"] != "assistant":
                 continue
             # several records share one message id; only the first carries usage
@@ -102,14 +106,16 @@ def render(sn, sess, turn_idx, context, budget):
                 bits = []
                 if e["thinking_chars"]:
                     bits.append(f"thinking {e['thinking_chars']}c")
-                bits.append(f"out {e['out']}tok")
+                bits.append(f"out {e['out']}tok" if capabilities.get("usage", True) else "token use unavailable")
                 if e.get("effort"):
                     bits.append(f"effort {e['effort']}")
                 if not emit(f"  A {inv_mod.iso(e['ts'])} [{', '.join(bits)}]"):
                     return out
             for tu in e["tool_uses"]:
                 r = results.get(tu["id"])
-                if r is None:
+                if not capabilities.get("tool_results", True):
+                    status = "result not recorded"
+                elif r is None:
                     status = "no result"
                 elif r["is_error"]:
                     status = f"ERROR {r['chars']}c"
