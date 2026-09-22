@@ -25,10 +25,11 @@ The goal is simple: get better results with less time and effort.
 
 ## Install
 
-In Claude Code:
+In Claude Code, add this repo as a marketplace, then install from it:
 
 ```
-/plugin install improve-clauding@vanillafairy
+/plugin marketplace add VanillaFairy/improve-clauding
+/plugin install improve-clauding@improve-clauding
 ```
 
 In Cursor, put this folder here:

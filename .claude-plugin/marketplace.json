@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-marketplace-manifest.json",
+  "name": "improve-clauding",
+  "owner": {
+    "name": "VanillaFairy",
+    "url": "https://github.com/VanillaFairy"
+  },
+  "description": "Install Improve Clauding as a Claude plugin.",
+  "plugins": [
+    {
+      "name": "improve-clauding",
+      "source": "./",
+      "version": "0.1.0",
+      "description": "Retrospective over recent Claude Code and Cursor sessions: separates the user's habits from agent/tool/model/router failures, reports patterns to fix and to endorse along six axes, and proposes rules, skill patches, skills, agents or hooks without applying them.",
+      "license": "MIT",
+      "keywords": ["retrospective", "habits", "sessions", "prompting", "workflow", "self-improvement"]
+    }
+  ]
+}
