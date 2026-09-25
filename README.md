@@ -25,11 +25,11 @@ The goal is simple: get better results with less time and effort.
 
 ## Install
 
-In Claude Code, add this repo as a marketplace, then install from it:
+In Claude Code, add the `vanillafairy` marketplace, then install from it:
 
 ```
-/plugin marketplace add VanillaFairy/improve-clauding
-/plugin install improve-clauding@improve-clauding
+/plugin marketplace add VanillaFairy/agentic-plugins
+/plugin install improve-clauding@vanillafairy
 ```
 
 In Cursor, put this folder here:
